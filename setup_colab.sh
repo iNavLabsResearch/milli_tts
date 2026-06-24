@@ -12,14 +12,22 @@ pip -q install --upgrade pip
 # `pip install -r requirements.txt` downgrades torch but leaves torchaudio on 2.11,
 # which breaks with: undefined symbol: torch_library_impl
 #
-# Install a matched GPU torch stack first (moshi-compatible), then the rest.
-CUDA_TAG=cu128
-if python -c "import torch; print(torch.version.cuda or '')" 2>/dev/null | grep -q '^12\.4'; then
-  CUDA_TAG=cu124
+# Fix: install torch + torchaudio *together* from one CUDA index with a single
+# `<2.10` constraint, so pip picks a co-released, ABI-matched pair whose wheels
+# actually exist on that index (no brittle hard-coded version).
+CUDA_TAG=cu124
+DETECTED="$(python -c 'import torch; print((torch.version.cuda or "").replace(".",""))' 2>/dev/null || true)"
+case "${DETECTED}" in
+  128|127|126) CUDA_TAG=cu128 ;;
+  124|123|122|121) CUDA_TAG=cu124 ;;
+esac
+echo "    PyTorch index: ${CUDA_TAG} (detected cuda='${DETECTED}')"
+if ! pip -q install "torch<2.10" "torchaudio<2.10" \
+      --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"; then
+  echo "    cu-index install failed; retrying on cu124…"
+  pip -q install "torch<2.10" "torchaudio<2.10" \
+    --index-url "https://download.pytorch.org/whl/cu124"
 fi
-echo "    PyTorch index: ${CUDA_TAG}"
-pip -q install "torch==2.9.1" "torchaudio==2.9.1" \
-  --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"
 
 REQ_NO_TORCH="$(mktemp)"
 grep -vE '^(torch|torchaudio)([<>=!~ \[].*)?$' requirements.txt \
@@ -28,8 +36,11 @@ pip -q install -r "${REQ_NO_TORCH}"
 rm -f "${REQ_NO_TORCH}"
 
 echo "==> Sanity import check…"
-python -c "import torch, torchaudio, transformers, datasets, wandb; \
+python -c "import torch, transformers, datasets, wandb; \
 print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+# torchaudio is optional (librosa/soundfile are used as fallbacks); never fail setup on it.
+python -c "import torchaudio; print('torchaudio', torchaudio.__version__, 'OK')" \
+  || echo '    WARN: torchaudio failed to load; continuing (librosa/soundfile fallback active).'
 
 echo "==> Running CPU smoke test (dummy codec, tiny model)…"
 python -m tests.smoke_test || echo 'smoke test skipped/failed (non-fatal)'

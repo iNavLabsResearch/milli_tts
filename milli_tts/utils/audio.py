@@ -39,9 +39,20 @@ def load_audio(path: str, target_sr: int | None = None,
 def resample(wav: torch.Tensor, orig_sr: int, target_sr: int) -> torch.Tensor:
     if orig_sr == target_sr:
         return wav
-    import torchaudio
+    # Prefer torchaudio, but fall back to librosa so a broken/absent torchaudio
+    # binary (a common Colab torch/torchaudio version mismatch) is non-fatal.
+    try:
+        import torchaudio
 
-    return torchaudio.functional.resample(wav, orig_sr, target_sr)
+        return torchaudio.functional.resample(wav, orig_sr, target_sr)
+    except Exception:
+        import librosa
+        import numpy as np
+
+        arr = wav.detach().cpu().numpy()
+        out = librosa.resample(np.ascontiguousarray(arr), orig_sr=orig_sr,
+                               target_sr=target_sr, axis=-1)
+        return torch.from_numpy(out).to(wav.dtype)
 
 
 def save_audio(path: str, wav: torch.Tensor, sample_rate: int) -> None:
