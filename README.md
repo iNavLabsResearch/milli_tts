@@ -8,6 +8,8 @@ neural audio codec — the same recipe Kyutai uses for Pocket-TTS — adapted to
 [`ai4bharat/IndicVoices`](https://huggingface.co/datasets/ai4bharat/IndicVoices)
 STT corpus, whose transcripts become TTS training labels.
 
+> Full diagrams + rationale: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (Mermaid).
+
 ```
 text ids ─► text embedding ─┐
                             ├─► Backbone (temporal) Transformer ─► h_t

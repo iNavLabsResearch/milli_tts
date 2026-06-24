@@ -1,5 +1,7 @@
-# secrets
+# secrets — never commit real credentials
 .env
+.env.local
+*.key
 
 # data & artifacts
 data/
