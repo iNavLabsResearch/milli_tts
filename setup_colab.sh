@@ -35,8 +35,12 @@ grep -vE '^(torch|torchaudio)([<>=!~ \[].*)?$' requirements.txt \
 pip -q install -r "${REQ_NO_TORCH}"
 rm -f "${REQ_NO_TORCH}"
 
+echo "==> Installing milli_tts package…"
+pip -q install -e .
+
 echo "==> Sanity import check…"
-python -c "import torch, transformers, datasets, wandb; \
+python -c "import milli_tts.data; import torch, transformers, datasets, wandb; \
+print('milli_tts.data OK'); \
 print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
 # torchaudio is optional (librosa/soundfile are used as fallbacks); never fail setup on it.
 python -c "import torchaudio; print('torchaudio', torchaudio.__version__, 'OK')" \

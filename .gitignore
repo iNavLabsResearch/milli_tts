@@ -1,8 +1,8 @@
 # secrets
 .env
 
-# data & artifacts
-data/
+# data & artifacts (repo-root only — do not ignore milli_tts/data Python package)
+/data/
 checkpoints/
 outputs/
 logs/
