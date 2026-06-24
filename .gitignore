@@ -1,0 +1,26 @@
+# secrets
+.env
+
+# data & artifacts
+data/
+checkpoints/
+outputs/
+logs/
+wandb/
+*.wav
+*.pt
+*.ckpt
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# os
+.DS_Store

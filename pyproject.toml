@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "milli_tts"
+version = "0.1.0"
+description = "Indic + English end-to-end TTS (RQ-Transformer on frozen Mimi) for Colab T4."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "iNavLabs Research" }]
+
+[tool.setuptools.packages.find]
+include = ["milli_tts*"]
+
+[project.scripts]
+milli-tts-train = "train:main"
+milli-tts-infer = "inference:main"
