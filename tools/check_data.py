@@ -46,11 +46,13 @@ def main() -> None:
         if got >= args.n:
             break
 
-    if got == 0:
+    ok = got > 0
+    if not ok:
         log.error("No usable samples produced — see skip reasons above.")
     else:
         log.info("OK: %d usable samples in %.1fs. Streaming works.",
                  got, time.time() - t0)
+    return ok
 
 
 def _short(sample) -> str:
@@ -59,4 +61,13 @@ def _short(sample) -> str:
 
 
 if __name__ == "__main__":
-    main()
+    import os
+    import sys
+
+    _ok = main()
+    # Hard-exit to skip interpreter finalization — HF streaming leaves a C
+    # prefetch thread alive that crashes during Py_Finalize (cosmetic
+    # "PyGILState_Release … finalizing"). The work is already done here.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0 if _ok else 1)

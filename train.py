@@ -55,4 +55,13 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import os
+    import sys
+
     main()
+    # Clean hard-exit: training (incl. W&B finish + final checkpoint) is done.
+    # Skips Py_Finalize, where HF streaming's background C thread can crash with
+    # a cosmetic "PyGILState_Release … finalizing".
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
