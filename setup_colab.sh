@@ -8,6 +8,12 @@ set -e
 echo "==> Installing milli_tts dependencies (T4)…"
 pip -q install --upgrade pip
 
+# FFmpeg/libsndfile so soundfile + librosa can decode IndicVoices audio without
+# torchcodec (which often fails on Colab: libavutil.so.* / torch ABI mismatch).
+echo "==> Installing audio codecs (ffmpeg, libsndfile)…"
+(apt-get -qq update && apt-get -qq install -y ffmpeg libsndfile1) >/dev/null 2>&1 \
+  || echo "    (apt install skipped — soundfile usually still works)"
+
 # Colab ships torch 2.11 + matching torchaudio.  moshi pins torch<2.10, so a plain
 # `pip install -r requirements.txt` downgrades torch but leaves torchaudio on 2.11,
 # which breaks with: undefined symbol: torch_library_impl

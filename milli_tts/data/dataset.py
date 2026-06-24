@@ -34,7 +34,7 @@ from milli_tts.core.logger import get_logger
 from milli_tts.core.static_memory_cache import StaticMemoryCache
 from milli_tts.data.text_tokenizer import TextTokenizer
 from milli_tts.data.voice_bank import VoiceBank
-from milli_tts.utils.audio import resample
+from milli_tts.utils.audio import load_audio, resample
 
 log = get_logger("data.dataset")
 
@@ -91,11 +91,19 @@ class IndicVoicesDataset(IterableDataset):
                     f"access', then retry. Original error: {exc}") from exc
             raise
         log.info("load_dataset() returned in %.1fs.", _time.time() - t0)
-        # Ensure the audio column decodes to the codec sample rate.
+        # Decode audio OURSELVES (soundfile) instead of letting `datasets` use
+        # torchcodec — torchcodec needs a matching FFmpeg/torch build that Colab
+        # often lacks (libavutil.so.* missing). `decode=False` hands us the raw
+        # encoded bytes; _extract_wav turns them into a waveform.
         audio_col = self._find_audio_col(ds)
         if audio_col:
-            ds = ds.cast_column(audio_col, Audio(sampling_rate=self.target_sr))
-        log.info("Stream ready (audio col=%s). Pulling rows…", audio_col)
+            try:
+                ds = ds.cast_column(audio_col, Audio(decode=False))
+            except Exception as exc:
+                log.warning("cast_column(decode=False) failed (%s); "
+                            "leaving column as-is.", exc)
+        log.info("Stream ready (audio col=%s, self-decode). Pulling rows…",
+                 audio_col)
         return ds
 
     @staticmethod
@@ -116,16 +124,54 @@ class IndicVoicesDataset(IterableDataset):
         return None
 
     # ------------------------------------------------------------------ #
+    def _to_target(self, arr: torch.Tensor, sr: int) -> torch.Tensor:
+        if arr.dim() > 1:                       # [C, T] or [T, C] -> mono [T]
+            arr = arr.mean(dim=0 if arr.shape[0] < arr.shape[-1] else -1)
+        if sr != self.target_sr:
+            arr = resample(arr.unsqueeze(0), sr, self.target_sr).squeeze(0)
+        return arr.to(torch.float32)
+
+    def _decode_bytes(self, raw: bytes) -> Optional[torch.Tensor]:
+        """Decode encoded audio bytes -> mono waveform at target sr (no torchcodec)."""
+        import io
+
+        try:
+            import soundfile as sf
+
+            data, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=True)
+            arr = torch.from_numpy(data.T)      # [C, T]
+            return self._to_target(arr, int(sr))
+        except Exception:
+            try:                                # last resort for odd codecs
+                import librosa
+
+                data, sr = librosa.load(io.BytesIO(raw), sr=self.target_sr,
+                                        mono=True)
+                return torch.from_numpy(data).to(torch.float32)
+            except Exception:
+                return None
+
     def _extract_wav(self, row: Dict) -> Optional[torch.Tensor]:
         audio = row.get("audio") or row.get("wav") or row.get("audio_filepath")
-        if isinstance(audio, dict) and "array" in audio:
-            arr = torch.as_tensor(audio["array"], dtype=torch.float32)
-            sr = int(audio.get("sampling_rate", self.target_sr))
-            if arr.dim() > 1:
-                arr = arr.mean(dim=-1)
-            if sr != self.target_sr:
-                arr = resample(arr.unsqueeze(0), sr, self.target_sr).squeeze(0)
-            return arr
+        if isinstance(audio, dict):
+            if "array" in audio and audio["array"] is not None:  # pre-decoded
+                arr = torch.as_tensor(audio["array"], dtype=torch.float32)
+                return self._to_target(arr, int(audio.get("sampling_rate",
+                                                           self.target_sr)))
+            if audio.get("bytes") is not None:                   # decode=False
+                return self._decode_bytes(audio["bytes"])
+            if audio.get("path"):                                # path on disk
+                try:
+                    wav, _ = load_audio(audio["path"], target_sr=self.target_sr)
+                    return wav.squeeze(0)
+                except Exception:
+                    return None
+        elif isinstance(audio, str):                             # bare path
+            try:
+                wav, _ = load_audio(audio, target_sr=self.target_sr)
+                return wav.squeeze(0)
+            except Exception:
+                return None
         return None
 
     def _process_row(self, row: Dict) -> Optional[Dict]:
