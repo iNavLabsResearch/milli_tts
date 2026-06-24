@@ -1,5 +1,6 @@
-# secrets
-.env
+# NOTE: .env is intentionally committed (user-accepted) so Colab reads secrets directly.
+.env.local
+*.key
 
 # data & artifacts (repo-root only — do not ignore milli_tts/data Python package)
 /data/

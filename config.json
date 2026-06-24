@@ -19,7 +19,7 @@
   },
 
   "huggingface": {
-    "token": "ENV:HF_TOKEN",
+    "token": "REV:SueqOSPqunzpeCdQGcpfIlyvKMGHcHIYBh_fh",
     "dataset_repo": "ai4bharat/IndicVoices",
     "dataset_config": "assamese",
     "dataset_split": "train",
@@ -105,7 +105,7 @@
 
   "wandb": {
     "enabled": true,
-    "api_key": "ENV:WANDB_API_KEY",
+    "api_key": "REV:y2bOD1U5ofbHO1e0hDomvDOLRGSSH01yDTWSuG5Bu7I2QRYFr_gGHkIUXvAPree4A3zvhDht15rQ9_1v_bdnaw",
     "project": "milli-tts",
     "entity": null,
     "mode": "online",

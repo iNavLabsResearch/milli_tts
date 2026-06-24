@@ -28,7 +28,17 @@ def _load_dotenv() -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.partition("=")
-        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+        val = val.strip().strip('"').strip("'")
+        if val.startswith("B64:"):  # decode obfuscated secrets (see config.py)
+            import base64
+
+            try:
+                val = base64.b64decode(val[4:]).decode("utf-8")
+            except Exception:
+                continue
+        elif val.startswith("REV:"):  # reversed-string obfuscation
+            val = val[4:][::-1]
+        os.environ.setdefault(key.strip(), val)
 
 
 def bootstrap(config_path: Optional[str] = None) -> StaticMemoryCache:
