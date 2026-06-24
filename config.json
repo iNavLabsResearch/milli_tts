@@ -92,7 +92,7 @@
     "grad_clip": 1.0,
     "lr_schedule": "cosine",
     "gradient_checkpointing": true,
-    "num_workers": 2,
+    "num_workers": 0,
     "log_every": 5,
     "eval_every": 1000,
     "save_every": 2000,

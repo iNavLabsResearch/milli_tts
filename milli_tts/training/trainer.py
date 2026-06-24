@@ -69,7 +69,10 @@ class Trainer:
         self.tracker = WandbTracker(self.cfg)
 
         self.amp_dtype, self.use_scaler = self._resolve_precision()
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_scaler)
+        try:  # torch>=2.4 prefers torch.amp.GradScaler("cuda", ...)
+            self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_scaler)
+        except (AttributeError, TypeError):
+            self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_scaler)
         self.step = 0
         self.best_loss = float("inf")
 
@@ -103,6 +106,28 @@ class Trainer:
             dataset, batch_size=self.tcfg.batch_size, collate_fn=collator,
             num_workers=self.tcfg.num_workers, pin_memory=(self.device.type == "cuda"),
             drop_last=True, persistent_workers=self.tcfg.num_workers > 0)
+
+    # ------------------------------------------------------------------ #
+    def _preflight_data(self) -> bool:
+        """Pull ONE sample in the main process (visible logs) before the loop.
+
+        This is the "load the stream first, then train" step: it surfaces the
+        dataset build logs, confirms access + field mapping, and times the first
+        usable sample — instead of the loop silently hanging in a worker.
+        """
+        log.info("Preflight: pulling one sample from the stream to verify "
+                 "access + field mapping (this is the slow part)…")
+        probe = IndicVoicesDataset(tokenizer=self.tokenizer,
+                                   voice_bank=self.voice_bank,
+                                   register_voices=False)
+        t0 = time.time()
+        for s in probe:
+            log.info("Preflight OK in %.1fs — dur=%.2fs spk=%s lang=%s "
+                     "text_tokens=%d. Data is flowing.", time.time() - t0,
+                     s["duration"], s["speaker_id"], s["lang"],
+                     len(s["text_ids"]))
+            return True
+        return False
 
     # ------------------------------------------------------------------ #
     @torch.no_grad()
@@ -140,6 +165,12 @@ class Trainer:
         # point — real `train/loss` lands on the first optimizer step below).
         self.tracker.log({"train/heartbeat": 1, "train/step": self.step},
                          step=self.step)
+
+        if not self._preflight_data():
+            raise RuntimeError(
+                "Data preflight failed — no usable samples from the stream. "
+                "Run `python tools/check_data.py` to debug (check dataset access "
+                "+ field mapping). Aborting before the training loop.")
 
         log.info("Warming up the streaming dataset — fetching the first batch "
                  "(IndicVoices streaming can take 1-3 min on first call)…")

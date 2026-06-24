@@ -63,25 +63,39 @@ class IndicVoicesDataset(IterableDataset):
 
     # ------------------------------------------------------------------ #
     def _build_hf_dataset(self):
+        import time as _time
+
         from datasets import Audio, load_dataset
 
-        log.info("Loading %s [config=%s split=%s streaming=%s]",
+        log.info("Loading %s [config=%s split=%s streaming=%s] — this opens the "
+                 "stream (first shard fetch can take a minute)…",
                  self.hf.dataset_repo, self.hf.dataset_config, self.split,
                  self.hf.streaming)
         kwargs = dict(split=self.split, streaming=self.hf.streaming,
                       token=self.hf.token)
-        if self.hf.dataset_config:
-            try:
+        t0 = _time.time()
+        try:
+            if self.hf.dataset_config:
                 ds = load_dataset(self.hf.dataset_repo, self.hf.dataset_config,
                                   **kwargs)
-            except Exception:
+            else:
                 ds = load_dataset(self.hf.dataset_repo, **kwargs)
-        else:
-            ds = load_dataset(self.hf.dataset_repo, **kwargs)
+        except Exception as exc:
+            msg = str(exc).lower()
+            if any(k in msg for k in ("gated", "403", "401", "authenticated",
+                                       "access", "permission")):
+                raise RuntimeError(
+                    f"Cannot access {self.hf.dataset_repo}: it is GATED. Open "
+                    f"https://huggingface.co/datasets/{self.hf.dataset_repo} "
+                    f"while logged in as the token owner and click 'Agree and "
+                    f"access', then retry. Original error: {exc}") from exc
+            raise
+        log.info("load_dataset() returned in %.1fs.", _time.time() - t0)
         # Ensure the audio column decodes to the codec sample rate.
         audio_col = self._find_audio_col(ds)
         if audio_col:
             ds = ds.cast_column(audio_col, Audio(sampling_rate=self.target_sr))
+        log.info("Stream ready (audio col=%s). Pulling rows…", audio_col)
         return ds
 
     @staticmethod
