@@ -1,6 +1,7 @@
 # ---- Core DL ----
-torch>=2.2.0
-torchaudio>=2.2.0
+# moshi requires torch<2.10; on Colab use setup_colab.sh (installs matched wheels).
+torch>=2.2.0,<2.10
+torchaudio>=2.2.0,<2.10
 numpy>=1.24
 einops>=0.7.0
 
