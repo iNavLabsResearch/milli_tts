@@ -95,11 +95,32 @@ class MimiCodec(nn.Module):
 
         cfg = StaticMemoryCache.config()
         token = cfg.huggingface.token
-        weight_path = hf_hub_download(
-            hf_repo, loaders.MIMI_NAME, token=token)
-        mimi = loaders.get_mimi(weight_path, device=device)
-        mimi.set_num_codebooks(num_codebooks)
-        return mimi
+        mimi_name = getattr(loaders, "MIMI_NAME",
+                            "tokenizer-e351c8d8-checkpoint125.safetensors")
+        default_repo = getattr(loaders, "DEFAULT_REPO",
+                               "kyutai/moshiko-pytorch-bf16")
+        # The moshi-format Mimi weight (MIMI_NAME) ships in the moshi LM repo,
+        # NOT in the standalone `kyutai/mimi` repo (which is transformers-format
+        # `model.safetensors`). Try the moshi repo first, then the configured
+        # repo, so a stale `codec.hf_repo` in config.json can't 404 us.
+        candidates, seen = [], set()
+        for repo in (default_repo, hf_repo):
+            if repo and repo not in seen:
+                seen.add(repo)
+                candidates.append(repo)
+
+        last_err: Exception | None = None
+        for repo in candidates:
+            try:
+                weight_path = hf_hub_download(repo, mimi_name, token=token)
+                mimi = loaders.get_mimi(weight_path, device=device)
+                mimi.set_num_codebooks(num_codebooks)
+                log.info("Mimi weights loaded from %s/%s", repo, mimi_name)
+                return mimi
+            except Exception as exc:  # try next candidate repo
+                log.debug("Mimi load from %s failed: %s", repo, exc)
+                last_err = exc
+        raise last_err if last_err else RuntimeError("Mimi load failed")
 
     # ------------------------------------------------------------------ #
     # Encode / decode

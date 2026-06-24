@@ -30,7 +30,7 @@
 
   "codec": {
     "name": "mimi",
-    "hf_repo": "kyutai/mimi",
+    "hf_repo": "kyutai/moshiko-pytorch-bf16",
     "sample_rate": 24000,
     "frame_rate": 12.5,
     "num_codebooks": 8,
