@@ -1,0 +1,130 @@
+{
+  "project": {
+    "name": "milli_tts",
+    "repo": "iNavLabsResearch/milli_tts",
+    "seed": 1337,
+    "run_name": "milli-tts-indic-v1"
+  },
+
+  "paths": {
+    "root": ".",
+    "data_dir": "data",
+    "cache_dir": "data/cache",
+    "raw_audio_dir": "data/audio",
+    "mimi_code_cache_dir": "data/mimi_codes",
+    "checkpoint_dir": "checkpoints",
+    "voice_bank_dir": "checkpoints/voices",
+    "log_dir": "logs",
+    "output_dir": "outputs"
+  },
+
+  "huggingface": {
+    "token": "ENV:HF_TOKEN",
+    "dataset_repo": "ai4bharat/IndicVoices",
+    "dataset_config": "assamese",
+    "dataset_split": "train",
+    "streaming": true,
+    "push_to_hub": false,
+    "model_hub_repo": "iNavLabsResearch/milli-tts-indic"
+  },
+
+  "codec": {
+    "name": "mimi",
+    "hf_repo": "kyutai/mimi",
+    "sample_rate": 24000,
+    "frame_rate": 12.5,
+    "num_codebooks": 8,
+    "max_codebooks": 32,
+    "codebook_size": 2048,
+    "freeze": true
+  },
+
+  "tokenizer": {
+    "type": "sentencepiece_hf",
+    "hf_repo": "google/byt5-small",
+    "fallback_repo": "ai4bharat/IndicBERTv2-MLM-only",
+    "max_text_len": 256,
+    "use_byte_fallback": true
+  },
+
+  "model": {
+    "arch": "rq_transformer_tts",
+    "d_model": 1024,
+    "backbone_layers": 12,
+    "backbone_heads": 16,
+    "depth_layers": 6,
+    "depth_heads": 8,
+    "depth_dim": 1024,
+    "ffn_mult": 4,
+    "dropout": 0.0,
+    "rope_theta": 10000.0,
+    "norm": "rmsnorm",
+    "activation": "gelu",
+    "tie_text_embeddings": false,
+    "max_seq_frames": 1500,
+    "text_delay": 0,
+    "audio_delay_steps": 2,
+    "stream_delay_frames": 16
+  },
+
+  "voice": {
+    "strategy": "embedding_table",
+    "embedding_dim": 1024,
+    "max_speakers": 2048,
+    "reference_clip_seconds": 10.0,
+    "allow_zero_shot_prefix": true,
+    "default_voice_id": "S4259699400335456"
+  },
+
+  "training": {
+    "device": "auto",
+    "precision": "bf16",
+    "fallback_precision": "fp16",
+    "batch_size": 8,
+    "grad_accum_steps": 4,
+    "max_steps": 200000,
+    "warmup_steps": 2000,
+    "lr": 0.0003,
+    "min_lr": 0.00001,
+    "weight_decay": 0.1,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "grad_clip": 1.0,
+    "lr_schedule": "cosine",
+    "gradient_checkpointing": true,
+    "num_workers": 2,
+    "log_every": 20,
+    "eval_every": 1000,
+    "save_every": 2000,
+    "keep_last_n_checkpoints": 3,
+    "resume_from": "latest",
+    "max_audio_seconds": 20.0,
+    "min_audio_seconds": 1.0,
+    "compile_model": false
+  },
+
+  "wandb": {
+    "enabled": true,
+    "api_key": "ENV:WANDB_API_KEY",
+    "project": "milli-tts",
+    "entity": null,
+    "mode": "online",
+    "log_audio_samples": true,
+    "audio_sample_every": 2000,
+    "watch_model": false
+  },
+
+  "inference": {
+    "device": "auto",
+    "precision": "fp16",
+    "temperature": 0.7,
+    "top_k": 250,
+    "top_p": 0.95,
+    "cfg_scale": 2.0,
+    "max_gen_seconds": 30.0,
+    "target_latency_ms": 100,
+    "use_kv_cache": true,
+    "use_cuda_graphs": false,
+    "stream_chunk_frames": 4
+  }
+}
