@@ -115,15 +115,22 @@ class IndicVoicesDataset(IterableDataset):
         return None
 
     def _process_row(self, row: Dict) -> Optional[Dict]:
+        sample, _ = self._process_row_diag(row)
+        return sample
+
+    def _process_row_diag(self, row: Dict):
+        """Like _process_row but also returns a short skip reason for diagnostics."""
         text = self._pick(row, _TEXT_FIELDS)
         if not text:
-            return None
+            return None, "no_text"
         wav = self._extract_wav(row)
         if wav is None or wav.numel() == 0:
-            return None
+            return None, "no_audio"
         dur = wav.numel() / self.target_sr
-        if dur < self.min_sec or dur > self.max_sec:
-            return None
+        if dur < self.min_sec:
+            return None, "too_short"
+        if dur > self.max_sec:
+            return None, "too_long"
 
         speaker_id = self._pick(row, _SPEAKER_FIELDS) or "unknown"
         gender = row.get("gender")
@@ -144,7 +151,7 @@ class IndicVoicesDataset(IterableDataset):
             "gender": gender or "",
             "lang": lang or "",
             "duration": float(dur),
-        }
+        }, "ok"
 
     # ------------------------------------------------------------------ #
     def __iter__(self) -> Iterator[Dict]:
@@ -156,11 +163,33 @@ class IndicVoicesDataset(IterableDataset):
         if worker is not None and self.hf.streaming:
             ds = ds.shard(num_shards=worker.num_workers, index=worker.id) \
                 if hasattr(ds, "shard") else ds
+        wid = worker.id if worker is not None else 0
+        seen = 0
+        yielded = 0
+        skip_reasons: Dict[str, int] = {}
         for i, row in enumerate(ds):
+            if seen == 0:
+                # Dump the real columns once so field-mapping bugs are obvious.
+                log.info("[loader w%d] first row keys: %s", wid,
+                         list(row.keys()))
+            seen += 1
             try:
-                sample = self._process_row(row)
+                sample, reason = self._process_row_diag(row)
             except Exception as exc:  # robust to occasional bad rows
-                log.debug("Skipping row %d: %s", i, exc)
-                continue
+                reason = f"exc:{type(exc).__name__}"
+                sample = None
             if sample is not None:
+                yielded += 1
                 yield sample
+            else:
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+
+            # Progress heartbeat so the terminal shows life during the (slow)
+            # streaming warmup, plus an early warning if nothing is usable.
+            if seen % 50 == 0:
+                log.info("[loader w%d] streamed=%d yielded=%d skips=%s",
+                         wid, seen, yielded, skip_reasons)
+            if seen == 200 and yielded == 0:
+                log.warning("[loader w%d] 200 rows streamed, 0 usable samples! "
+                            "Likely a field/audio mapping issue. skips=%s",
+                            wid, skip_reasons)

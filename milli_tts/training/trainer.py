@@ -141,13 +141,21 @@ class Trainer:
         self.tracker.log({"train/heartbeat": 1, "train/step": self.step},
                          step=self.step)
 
+        log.info("Warming up the streaming dataset — fetching the first batch "
+                 "(IndicVoices streaming can take 1-3 min on first call)…")
         data_iter = iter(loader)
+        first_batch = True
+        warmup_t = time.time()
         while self.step < self.tcfg.max_steps:
             try:
                 batch = next(data_iter)
             except StopIteration:
                 data_iter = iter(loader)
                 batch = next(data_iter)
+            if first_batch:
+                log.info("First batch received after %.1fs (size=%d). Training "
+                         "loop is live.", time.time() - warmup_t, len(batch))
+                first_batch = False
             batch = batch.to(self.device)
 
             codes, audio_mask = self._encode_batch(batch)
