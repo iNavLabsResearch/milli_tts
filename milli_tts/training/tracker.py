@@ -52,6 +52,13 @@ class WandbTracker:
             config=self.cfg.raw,
             resume="allow",
         )
+        # Make `train/step` the x-axis for all train panels (cleaner than the
+        # internal wandb step, and robust to irregular logging cadence).
+        try:
+            wandb.define_metric("train/step")
+            wandb.define_metric("train/*", step_metric="train/step")
+        except Exception:
+            pass
         log.info("W&B run started: %s", getattr(self._run, "url", "(offline)"))
         return self
 

@@ -93,7 +93,7 @@
     "lr_schedule": "cosine",
     "gradient_checkpointing": true,
     "num_workers": 2,
-    "log_every": 20,
+    "log_every": 5,
     "eval_every": 1000,
     "save_every": 2000,
     "keep_last_n_checkpoints": 3,

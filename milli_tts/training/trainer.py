@@ -133,6 +133,13 @@ class Trainer:
         micro = 0
         t0 = time.time()
         running = 0.0
+        micro_since_log = 0
+        last_log_step = self.step
+
+        # Heartbeat so a `train` section appears in W&B immediately (no fake loss
+        # point — real `train/loss` lands on the first optimizer step below).
+        self.tracker.log({"train/heartbeat": 1, "train/step": self.step},
+                         step=self.step)
 
         data_iter = iter(loader)
         while self.step < self.tcfg.max_steps:
@@ -159,6 +166,7 @@ class Trainer:
             self.scaler.scale(loss).backward()
             running += out["loss"].item()
             micro += 1
+            micro_since_log += 1
 
             if micro % accum == 0:
                 self.scaler.unscale_(self.optimizer)
@@ -170,12 +178,19 @@ class Trainer:
                 lr = self.scheduler.step()
                 self.step += 1
 
-                if self.step % self.tcfg.log_every == 0:
-                    avg = running / (accum * self.tcfg.log_every)
+                # Log every step for the first 50 (so the loss curve appears
+                # within seconds of the first batch), then throttle to log_every.
+                should_log = (self.step <= 50
+                              or self.step % self.tcfg.log_every == 0)
+                if should_log:
+                    avg = running / max(1, micro_since_log)
                     running = 0.0
+                    micro_since_log = 0
                     dt = time.time() - t0
                     t0 = time.time()
-                    sps = self.tcfg.log_every / max(dt, 1e-6)
+                    steps_done = max(1, self.step - last_log_step)
+                    last_log_step = self.step
+                    sps = steps_done / max(dt, 1e-6)
                     metrics = {
                         "train/loss": avg,
                         "train/acc": out["acc"].item(),
@@ -184,6 +199,7 @@ class Trainer:
                         "train/lr": lr,
                         "train/steps_per_sec": sps,
                         "train/voices_seen": len(self.voice_bank),
+                        "train/step": self.step,
                     }
                     self.tracker.log(metrics, step=self.step)
                     log.info("step %d | loss %.4f | acc %.3f | lr %.2e | %.2f it/s",
