@@ -72,7 +72,12 @@ class WandbTracker:
 
     def log(self, metrics: Dict[str, float], step: Optional[int] = None) -> None:
         if self.enabled and self._wandb:
-            self._wandb.log(metrics, step=step)
+            # Deliberately DON'T pass wandb's internal `step`: the x-axis is
+            # driven by the logged "train/step" metric (see define_metric in
+            # start()). Forcing the internal step would make wandb DROP a second
+            # log at the same step — exactly what was silently swallowing the
+            # val/* points logged right after train/* on eval steps.
+            self._wandb.log(metrics)
 
     def log_audio(self, tag: str, wav, sample_rate: int,
                   step: Optional[int] = None, caption: str = "") -> None:
@@ -85,7 +90,9 @@ class WandbTracker:
                 wav = wav.detach().float().cpu().numpy()
             wav = np.asarray(wav).squeeze()
             audio = self._wandb.Audio(wav, sample_rate=sample_rate, caption=caption)
-            self._wandb.log({tag: audio}, step=step)
+            # No explicit step (see log()): keep the x-axis on train/step and
+            # avoid same-step drops.
+            self._wandb.log({tag: audio, "train/step": step})
         except Exception as exc:  # pragma: no cover
             log.debug("log_audio failed: %s", exc)
 

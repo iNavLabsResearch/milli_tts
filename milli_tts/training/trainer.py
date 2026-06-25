@@ -33,6 +33,7 @@ from milli_tts.data.voice_bank import VoiceBank
 from milli_tts.models.factory import build_model
 from milli_tts.training.checkpoint import CheckpointManager
 from milli_tts.training.distributed import barrier, setup_distributed
+from milli_tts.training.hf_sync import HFCheckpointSync
 from milli_tts.training.optim import CosineWarmupSchedule, build_optimizer
 from milli_tts.training.tracker import WandbTracker
 
@@ -87,6 +88,14 @@ class Trainer:
         self.tracker = WandbTracker(self.cfg)
         if not self.dist.is_main:
             self.tracker.enabled = False
+
+        # Continuous HF checkpoint backup (rank 0 only). Survives a Kaggle
+        # disconnect; each run gets its own timestamped+indexed repo folder.
+        self.hf_sync = HFCheckpointSync(
+            repo=self.cfg.huggingface.checkpoint_repo,
+            token=self.cfg.huggingface.token,
+            enabled=(self.dist.is_main
+                     and self.cfg.huggingface.push_checkpoints_to_hub))
 
         self.amp_dtype, self.use_scaler = self._resolve_precision()
         try:  # torch>=2.4 prefers torch.amp.GradScaler("cuda", ...)
@@ -211,8 +220,13 @@ class Trainer:
             if n >= self.tcfg.eval_samples:
                 break
         self._val_batches = batches
-        log.info("Validation set ready: %d batches (%d samples).",
-                 len(batches), n)
+        if not batches:
+            log.warning("Validation set is EMPTY — no val metrics will be "
+                        "logged. Check that the first %d stream rows pass the "
+                        "duration/lang filters.", self.tcfg.eval_samples)
+        else:
+            log.info("Validation set ready: %d batches (%d samples).",
+                     len(batches), n)
         return batches
 
     @torch.no_grad()
@@ -418,18 +432,27 @@ class Trainer:
                                  lr, sps)
 
                 # ---- periodic validation (all ranks reach the barrier) ---- #
+                saved_this_step = False
                 if self.step % self.tcfg.eval_every == 0:
-                    val = self._validate()  # metrics on rank 0, None elsewhere
+                    try:
+                        val = self._validate()  # metrics on rank 0, else None
+                    except Exception as exc:  # never let val crash training
+                        log.warning("validation failed at step %d: %s",
+                                    self.step, exc)
+                        val = None
                     if val is not None:
                         val["train/step"] = self.step
                         self.tracker.log(val, step=self.step)
                         log.info("VAL step %d | val_loss %.4f | val_acc %.3f | "
-                                 "val_ppl %.2f", self.step, val["val/loss"],
-                                 val["val/acc"], val["val/ppl"])
+                                 "val_acc_cb0 %.3f | val_ppl %.2f", self.step,
+                                 val["val/loss"], val["val/acc"],
+                                 val["val/acc_cb0"], val["val/ppl"])
                         self._save(val_loss=val["val/loss"])
+                        saved_this_step = True
                     barrier()
 
-                if self.step % self.tcfg.save_every == 0:
+                # Periodic checkpoint (skip if validation just saved this step).
+                if self.step % self.tcfg.save_every == 0 and not saved_this_step:
                     self._save()
 
                 if (self.cfg.wandb.log_audio_samples and self.dist.is_main
@@ -446,7 +469,12 @@ class Trainer:
     # ------------------------------------------------------------------ #
     def _save(self, *, val_loss: Optional[float] = None,
               final: bool = False) -> None:
-        """Checkpoint (rank 0 only). ``best.pt`` tracks lowest validation loss."""
+        """Checkpoint (rank 0 only). ``best.pt`` tracks lowest validation loss.
+
+        After writing locally, the rolling ``latest.pt`` is mirrored to the HF
+        repo (in the background) so a disconnect never loses progress; the final
+        save is uploaded synchronously as ``final.pt``.
+        """
         if not self.dist.is_main:
             return
         is_best = val_loss is not None and val_loss < self.best_val
@@ -460,6 +488,10 @@ class Trainer:
                               "voices": len(self.voice_bank),
                               "tokenizer_vocab": self.tokenizer.vocab_size},
                        is_best=is_best)
+        if final:
+            self.hf_sync.push_final(self.ckpt.latest_path)
+        else:
+            self.hf_sync.push_latest(self.ckpt.latest_path)
 
     def _maybe_resume(self) -> None:
         # Every rank loads the same checkpoint into its (identical) raw module,

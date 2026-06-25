@@ -106,6 +106,11 @@ class HuggingFaceConfig:
     streaming: bool = True
     push_to_hub: bool = False
     model_hub_repo: str = "iNavLabsResearch/milli-tts-indic"
+    # Continuously back up training checkpoints to this HF model repo (created
+    # if missing, under the token owner's namespace). Each run gets its own
+    # timestamped+indexed folder. Disconnect-proof checkpointing.
+    push_checkpoints_to_hub: bool = False
+    checkpoint_repo: str = "milli_tts_weights"
     # Languages to keep (ISO codes like "hi"/"as" or names like "hindi").
     # IndicVoices ships one HF config per language, so a single entry here also
     # auto-selects the matching `dataset_config`. Empty list or ["all"] = keep
