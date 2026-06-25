@@ -105,7 +105,11 @@ class Trainer:
         self.step = 0
         self.best_loss = float("inf")     # best train loss (legacy)
         self.best_val = float("inf")      # best validation loss (checkpoint key)
-        self._val_batches: Optional[List[TTSBatch]] = None
+        self._new_best = False            # a better val loss seen since last save
+        # Cached, PRE-ENCODED validation set: list of (text_ids, text_mask,
+        # codes, audio_mask, speaker_index, n_frames). Mimi-encoded once so the
+        # frequent (every eval_every) validation is just a model forward.
+        self._val_data: Optional[List[tuple]] = None
 
         if self.tcfg.compile_model:
             try:
@@ -129,7 +133,10 @@ class Trainer:
             return model
         common = dict(device_ids=[self.dist.local_rank],
                       output_device=self.dist.local_rank,
-                      gradient_as_bucket_view=True)
+                      gradient_as_bucket_view=True,
+                      # The model has no buffers (RMSNorm/RoPE carry none), so
+                      # skip DDP's per-forward buffer broadcast — pure overhead.
+                      broadcast_buffers=False)
         try:
             ddp = DDP(model, static_graph=True, **common)
             log.info("DDP wrap OK (static_graph=True) on rank %d.", self.dist.rank)
@@ -194,17 +201,18 @@ class Trainer:
     # ------------------------------------------------------------------ #
     # Validation
     # ------------------------------------------------------------------ #
-    def _get_val_batches(self) -> List[TTSBatch]:
-        """Build (once, on the main process) a FIXED held-out validation set.
+    @torch.no_grad()
+    def _prepare_val(self) -> List[tuple]:
+        """Build the FIXED held-out val set ONCE and Mimi-encode it up front.
 
-        The set is the first ``eval_samples`` stream rows — disjoint from
-        training, which skips them. Collated batches are cached on CPU so every
-        evaluation runs on exactly the same data, making the val-loss curve
-        directly comparable across steps.
+        The set is the first ``eval_samples`` stream rows (disjoint from
+        training, which skips them). We cache the encoded tensors on-device so
+        each later validation is a pure model forward — cheap enough to run
+        every few training steps. Main process only.
         """
-        if self._val_batches is not None:
-            return self._val_batches
-        log.info("Building fixed validation set (~%d samples)…",
+        if self._val_data is not None:
+            return self._val_data
+        log.info("Building + encoding fixed validation set (~%d samples)…",
                  self.tcfg.eval_samples)
         val_ds = IndicVoicesDataset(tokenizer=self.tokenizer,
                                     voice_bank=self.voice_bank,
@@ -213,49 +221,49 @@ class Trainer:
         collator = DelayedStreamCollator(text_pad_id=self.tokenizer.pad_id)
         loader = DataLoader(val_ds, batch_size=self.tcfg.batch_size,
                             collate_fn=collator, num_workers=0, drop_last=False)
-        batches, n = [], 0
-        for b in loader:
-            batches.append(b)
-            n += len(b)
+        data, n = [], 0
+        for batch in loader:
+            batch = batch.to(self.device)
+            codes, audio_mask = self._encode_batch(batch)  # Mimi encode (once)
+            n_frames = int(audio_mask.sum().item())
+            if n_frames > 0:
+                data.append((batch.text_ids, batch.text_mask, codes,
+                             audio_mask, batch.speaker_index, n_frames))
+            n += len(batch)
             if n >= self.tcfg.eval_samples:
                 break
-        self._val_batches = batches
-        if not batches:
+        self._val_data = data
+        if not data:
             log.warning("Validation set is EMPTY — no val metrics will be "
                         "logged. Check that the first %d stream rows pass the "
                         "duration/lang filters.", self.tcfg.eval_samples)
         else:
-            log.info("Validation set ready: %d batches (%d samples).",
-                     len(batches), n)
-        return batches
+            log.info("Validation set ready & encoded: %d batches (%d samples). "
+                     "Each eval is now a forward-only pass.", len(data), n)
+        return data
 
     @torch.no_grad()
     def _validate(self) -> Optional[dict]:
-        """Mean validation loss over the fixed val set (main process only).
+        """Mean validation loss over the pre-encoded val set (main process only).
 
-        Runs on the raw (unwrapped) model — no gradients, no DDP collectives.
-        Each batch's loss is the mean over its ``valid_frames × Q`` audio tokens;
-        we re-weight by ``valid_frames`` so the aggregate is a true token-level
-        mean rather than a mean-of-means biased by short batches.
+        Runs on the raw (unwrapped) model — no gradients, no DDP collectives, no
+        re-encoding. Each batch's loss is the mean over its ``valid_frames × Q``
+        audio tokens; we re-weight by ``valid_frames`` so the aggregate is a true
+        token-level mean rather than a mean-of-means biased by short batches.
         """
         if not self.dist.is_main:
             return None
         self.model.eval()
         loss_sum = acc_sum = acc0_sum = 0.0
         frame_sum = 0
-        for batch in self._get_val_batches():
-            batch = batch.to(self.device)
-            codes, audio_mask = self._encode_batch(batch)
-            n_frames = int(audio_mask.sum().item())
-            if n_frames == 0:
-                continue
+        for text_ids, text_mask, codes, audio_mask, spk, n_frames in \
+                self._prepare_val():
             with torch.autocast(device_type=self.device.type,
                                 dtype=self.amp_dtype,
                                 enabled=self.device.type == "cuda"):
                 out = self.model.compute_loss(
-                    text_ids=batch.text_ids, text_mask=batch.text_mask,
-                    audio_codes=codes, audio_mask=audio_mask,
-                    speaker_index=batch.speaker_index)
+                    text_ids=text_ids, text_mask=text_mask, audio_codes=codes,
+                    audio_mask=audio_mask, speaker_index=spk)
             loss_sum += out["loss"].item() * n_frames
             acc_sum += out["acc"].item() * n_frames
             acc0_sum += out["acc_cb0"].item() * n_frames
@@ -321,7 +329,12 @@ class Trainer:
         accum = max(1, self.tcfg.grad_accum_steps)
         micro = 0
         t0 = time.time()
-        running = running_acc = running_acc0 = 0.0
+        # Accumulate log metrics on-GPU and sync (.item()) only when we log, not
+        # every micro-batch — fewer GPU→CPU stalls keeps the GPU fed. Pure
+        # bookkeeping; training math is unchanged.
+        running = torch.zeros((), device=self.device)
+        running_acc = torch.zeros((), device=self.device)
+        running_acc0 = torch.zeros((), device=self.device)
         micro_since_log = 0
         last_log_step = self.step
 
@@ -377,9 +390,10 @@ class Trainer:
                 loss = out["loss"] / accum
 
             self.scaler.scale(loss).backward()
-            running += out["loss"].item()
-            running_acc += out["acc"].item()
-            running_acc0 += out["acc_cb0"].item()
+            # GPU-side accumulation (detached) — no per-step sync.
+            running += out["loss"].detach()
+            running_acc += out["acc"].detach()
+            running_acc0 += out["acc_cb0"].detach()
             micro += 1
             micro_since_log += 1
 
@@ -402,10 +416,11 @@ class Trainer:
                     # Average ALL scalars over the log window (not just loss) so
                     # the curves reflect a real running mean instead of a single
                     # noisy micro-batch — this is what makes acc/acc_cb0 readable.
-                    avg = running / n
-                    avg_acc = running_acc / n
-                    avg_acc0 = running_acc0 / n
-                    running = running_acc = running_acc0 = 0.0
+                    # One .item() each here is the only GPU→CPU sync per window.
+                    avg = (running / n).item()
+                    avg_acc = (running_acc / n).item()
+                    avg_acc0 = (running_acc0 / n).item()
+                    running.zero_(); running_acc.zero_(); running_acc0.zero_()
                     micro_since_log = 0
                     dt = time.time() - t0
                     t0 = time.time()
@@ -431,8 +446,9 @@ class Trainer:
                                  avg_acc, avg_acc0,
                                  lr, sps)
 
-                # ---- periodic validation (all ranks reach the barrier) ---- #
-                saved_this_step = False
+                # ---- frequent validation: log only, NO checkpoint here so the
+                # eval cadence (e.g. every 10 steps) is decoupled from the much
+                # heavier checkpoint+HF-push cadence. (All ranks hit the barrier.)
                 if self.step % self.tcfg.eval_every == 0:
                     try:
                         val = self._validate()  # metrics on rank 0, else None
@@ -443,23 +459,26 @@ class Trainer:
                     if val is not None:
                         val["train/step"] = self.step
                         self.tracker.log(val, step=self.step)
-                        log.info("VAL step %d | val_loss %.4f | val_acc %.3f | "
-                                 "val_acc_cb0 %.3f | val_ppl %.2f", self.step,
-                                 val["val/loss"], val["val/acc"],
-                                 val["val/acc_cb0"], val["val/ppl"])
-                        self._save(val_loss=val["val/loss"])
-                        saved_this_step = True
+                        if val["val/loss"] < self.best_val:
+                            self.best_val = val["val/loss"]
+                            self._new_best = True
+                        if self.step % self.tcfg.log_every == 0:
+                            log.info("VAL step %d | val_loss %.4f | val_acc %.3f "
+                                     "| val_acc_cb0 %.3f | val_ppl %.2f",
+                                     self.step, val["val/loss"], val["val/acc"],
+                                     val["val/acc_cb0"], val["val/ppl"])
                     barrier()
 
-                # Periodic checkpoint (skip if validation just saved this step).
-                if self.step % self.tcfg.save_every == 0 and not saved_this_step:
-                    self._save()
+                # ---- checkpoint + HF push (rare cadence) ------------------ #
+                if self.step % self.tcfg.save_every == 0:
+                    self._save(is_best=self._new_best)
+                    self._new_best = False
 
                 if (self.cfg.wandb.log_audio_samples and self.dist.is_main
                         and self.step % self.cfg.wandb.audio_sample_every == 0):
                     self._log_audio_sample(batch)
 
-        self._save(final=True)
+        self._save(is_best=self._new_best, final=True)
         if self.dist.is_main:
             self.voice_bank.save()
         self.tracker.finish()
@@ -467,9 +486,9 @@ class Trainer:
         log.info("Training complete (%d steps).", self.step)
 
     # ------------------------------------------------------------------ #
-    def _save(self, *, val_loss: Optional[float] = None,
-              final: bool = False) -> None:
-        """Checkpoint (rank 0 only). ``best.pt`` tracks lowest validation loss.
+    def _save(self, *, is_best: bool = False, final: bool = False) -> None:
+        """Checkpoint (rank 0 only). ``best.pt`` tracks lowest validation loss
+        (``best_val`` is updated in the validation loop).
 
         After writing locally, the rolling ``latest.pt`` is mirrored to the HF
         repo (in the background) so a disconnect never loses progress; the final
@@ -477,14 +496,10 @@ class Trainer:
         """
         if not self.dist.is_main:
             return
-        is_best = val_loss is not None and val_loss < self.best_val
-        if val_loss is not None:
-            self.best_val = min(self.best_val, val_loss)
         self.voice_bank.save()
         self.ckpt.save(step=self.step, model=self.model,
                        optimizer=self.optimizer, scheduler=self.scheduler,
-                       extra={"val_loss": (val_loss if val_loss is not None
-                                           else self.best_val),
+                       extra={"val_loss": self.best_val,
                               "voices": len(self.voice_bank),
                               "tokenizer_vocab": self.tokenizer.vocab_size},
                        is_best=is_best)
