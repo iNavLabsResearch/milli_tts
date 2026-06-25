@@ -20,8 +20,8 @@
 
   "huggingface": {
     "token": "REV:SueqOSPqunzpeCdQGcpfIlyvKMGHcHIYBh_fh",
-    "dataset_repo": "ai4bharat/IndicVoices",
-    "dataset_config": "hindi",
+    "dataset_repo": "SPRINGLab/IndicTTS-Hindi",
+    "dataset_config": "default",
     "dataset_split": "train",
     "streaming": true,
     "push_to_hub": false,
@@ -37,7 +37,8 @@
     "num_codebooks": 8,
     "max_codebooks": 32,
     "codebook_size": 2048,
-    "freeze": true
+    "freeze": true,
+    "allow_dummy": false
   },
 
   "tokenizer": {
@@ -74,7 +75,7 @@
     "max_speakers": 2048,
     "reference_clip_seconds": 10.0,
     "allow_zero_shot_prefix": true,
-    "default_voice_id": "S4259699400335456"
+    "default_voice_id": "hi_female"
   },
 
   "training": {

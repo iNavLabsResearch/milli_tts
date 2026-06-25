@@ -100,8 +100,8 @@ class PathsConfig:
 @dataclass(frozen=True)
 class HuggingFaceConfig:
     token: Optional[str] = None
-    dataset_repo: str = "ai4bharat/IndicVoices"
-    dataset_config: str = "hindi"
+    dataset_repo: str = "SPRINGLab/IndicTTS-Hindi"
+    dataset_config: Optional[str] = "default"
     dataset_split: str = "train"
     streaming: bool = True
     push_to_hub: bool = False
@@ -123,6 +123,11 @@ class CodecConfig:
     max_codebooks: int = 32
     codebook_size: int = 2048
     freeze: bool = True
+    # When False (the default for real training) a failure to load the real
+    # Mimi codec is a hard error instead of silently falling back to the dummy
+    # codec — training on dummy (pseudo-random) codes never converges. Set True
+    # only for CPU smoke tests where `moshi` isn't installed.
+    allow_dummy: bool = False
 
 
 @dataclass(frozen=True)

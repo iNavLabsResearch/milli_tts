@@ -1,11 +1,15 @@
-"""IndicVoices dataset adapter.
+"""Hugging Face TTS dataset adapter (IndicTTS-Hindi / IndicVoices).
 
-The ai4bharat/IndicVoices corpus is an STT corpus: each row has an audio clip,
-its transcript (``normalized`` / ``text``), a ``speaker_id`` (~400 distinct
-speakers), ``gender``, ``lang`` and rich metadata. For TTS we simply invert the
-task — **text is the input, the spoken waveform is the target** — which is
-exactly what a delayed-streams TTS model trains on. So yes: STT labels are
-perfectly good TTS training pairs.
+Primary target: **SPRINGLab/IndicTTS-Hindi** — a clean studio TTS corpus whose
+rows carry only ``audio``, ``text`` (Devanagari Hindi) and ``gender`` (a
+``ClassLabel`` of ``female``/``male``). It has **no per-row speaker_id or lang**,
+so this adapter derives a stable speaker id from gender (``hi_female`` /
+``hi_male`` → two learned voice embeddings) and assumes the corpus language.
+
+It also stays backward-compatible with **ai4bharat/IndicVoices**, an STT corpus
+(audio + ``normalized``/``text`` transcript + ``speaker_id`` + ``gender`` +
+``lang``). For TTS we simply invert the task — **text is the input, the spoken
+waveform is the target** — so STT labels are perfectly good TTS training pairs.
 
 This class yields lightweight per-utterance samples:
 
@@ -90,22 +94,34 @@ class IndicVoicesDataset(IterableDataset):
         self.tokenizer = tokenizer or TextTokenizer.from_config()
         self.voice_bank = voice_bank or VoiceBank.from_config()
         self._hf_dataset = None
+        self._gender_names = None  # filled from the gender ClassLabel feature
 
         # ---- language selection -------------------------------------- #
-        # `languages` from config decides which language(s) to keep. Because
-        # IndicVoices is one config per language, a single requested language
-        # also auto-selects the matching `dataset_config` (so editing
-        # `languages: ["hi"]` alone is enough — no stale config can leak the
-        # wrong language in).
+        # `languages` from config decides which language(s) to keep.
         self.allowed_langs = _normalize_langs(getattr(self.hf, "languages", None))
         self.dataset_config = self.hf.dataset_config
-        if len(self.allowed_langs) == 1:
+
+        # IndicVoices ships one HF *config per language*, so a single requested
+        # language also auto-selects the matching `dataset_config`. This remap is
+        # IndicVoices-specific — other corpora (e.g. SPRINGLab/IndicTTS-Hindi,
+        # config "default") must keep their own config name, so gate it on repo.
+        is_indicvoices = "indicvoices" in str(self.hf.dataset_repo).lower()
+        if is_indicvoices and len(self.allowed_langs) == 1:
             only = next(iter(self.allowed_langs))
             mapped = _LANG_CODE_TO_CONFIG.get(only)
             if mapped and mapped != self.dataset_config:
                 log.info("languages=['%s'] -> using IndicVoices config '%s' "
                          "(was '%s')", only, mapped, self.dataset_config)
                 self.dataset_config = mapped
+
+        # Fallback language for corpora without a per-row `lang` field (e.g.
+        # IndicTTS-Hindi is entirely Hindi). Prefer the single requested lang,
+        # else the lang implied by the config name, else "" (= unknown).
+        if len(self.allowed_langs) == 1:
+            self.default_lang = next(iter(self.allowed_langs))
+        else:
+            self.default_lang = _CONFIG_TO_LANG_CODE.get(
+                str(self.dataset_config).lower(), "")
 
     # ------------------------------------------------------------------ #
     def _build_hf_dataset(self):
@@ -148,8 +164,13 @@ class IndicVoicesDataset(IterableDataset):
             except Exception as exc:
                 log.warning("cast_column(decode=False) failed (%s); "
                             "leaving column as-is.", exc)
-        log.info("Stream ready (audio col=%s, self-decode). Pulling rows…",
-                 audio_col)
+        # `gender` is often a HF ClassLabel, which streams as an int (0/1). Grab
+        # its class names once so rows can be mapped back to "female"/"male".
+        feats = getattr(ds, "features", None)
+        gfeat = feats.get("gender") if feats else None
+        self._gender_names = list(getattr(gfeat, "names", None) or []) or None
+        log.info("Stream ready (audio col=%s, gender_names=%s, self-decode). "
+                 "Pulling rows…", audio_col, self._gender_names)
         return ds
 
     @staticmethod
@@ -168,6 +189,24 @@ class IndicVoicesDataset(IterableDataset):
             if isinstance(v, str) and v.strip():
                 return v
         return None
+
+    def _gender_name(self, gender) -> Optional[str]:
+        """Normalize a row's gender to a lowercase name ("female"/"male").
+
+        Handles both raw strings and HF ClassLabel ints (mapped via the class
+        names captured at stream build time).
+        """
+        if gender is None or isinstance(gender, bool):
+            return None
+        if isinstance(gender, str):
+            return gender.strip().lower() or None
+        try:  # ClassLabel int -> name
+            idx = int(gender)
+        except (TypeError, ValueError):
+            return None
+        if self._gender_names and 0 <= idx < len(self._gender_names):
+            return str(self._gender_names[idx]).strip().lower()
+        return str(idx)
 
     # ------------------------------------------------------------------ #
     def _to_target(self, arr: torch.Tensor, sr: int) -> torch.Tensor:
@@ -231,8 +270,10 @@ class IndicVoicesDataset(IterableDataset):
             return None, "no_text"
 
         # Language filter FIRST (cheap, before decoding audio): drop rows whose
-        # language isn't in the configured allow-list.
-        lang = row.get("lang") or self.dataset_config
+        # language isn't in the configured allow-list. Corpora without a per-row
+        # `lang` (e.g. IndicTTS-Hindi) fall back to `default_lang`, which is the
+        # requested language — so the whole single-language corpus passes.
+        lang = row.get("lang") or self.default_lang
         lang_code = str(lang).strip().lower()
         lang_code = _CONFIG_TO_LANG_CODE.get(lang_code, lang_code)
         if self.allowed_langs and lang_code not in self.allowed_langs:
@@ -247,11 +288,16 @@ class IndicVoicesDataset(IterableDataset):
         if dur > self.max_sec:
             return None, "too_long"
 
-        speaker_id = self._pick(row, _SPEAKER_FIELDS) or "unknown"
-        gender = row.get("gender")
+        gender = self._gender_name(row.get("gender"))
+        # Speaker identity: use an explicit speaker_id when the corpus has one;
+        # otherwise derive a stable id from (lang, gender) — IndicTTS-Hindi then
+        # yields exactly two voices ("hi_female"/"hi_male").
+        speaker_id = self._pick(row, _SPEAKER_FIELDS)
+        if not speaker_id:
+            speaker_id = f"{lang_code or 'spk'}_{gender or 'unknown'}"
         if self.register_voices:
             spk_index = self.voice_bank.add_or_get(speaker_id, gender=gender,
-                                                   lang=lang)
+                                                   lang=lang_code)
         else:
             spk_index = (self.voice_bank.index_of(speaker_id)
                          if speaker_id in self.voice_bank else 0)
@@ -263,7 +309,7 @@ class IndicVoicesDataset(IterableDataset):
             "speaker_index": spk_index,
             "speaker_id": speaker_id,
             "gender": gender or "",
-            "lang": lang or "",
+            "lang": lang_code or "",
             "duration": float(dur),
         }, "ok"
 

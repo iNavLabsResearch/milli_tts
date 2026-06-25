@@ -50,13 +50,22 @@ class MimiCodec(nn.Module):
     # Construction
     # ------------------------------------------------------------------ #
     @classmethod
-    def from_config(cls, *, allow_dummy: bool = True,
+    def from_config(cls, *, allow_dummy: Optional[bool] = None,
                     device: Optional[torch.device] = None) -> "MimiCodec":
-        """Build (and cache) the codec described by ``config.json``."""
+        """Build (and cache) the codec described by ``config.json``.
+
+        ``allow_dummy`` controls the fallback when the real Mimi weights can't be
+        loaded. ``None`` (the default) reads ``codec.allow_dummy`` from config —
+        ``False`` for real training, so a load failure raises instead of silently
+        training on garbage dummy codes. Pass ``True`` explicitly for CPU smoke
+        tests where ``moshi`` isn't installed.
+        """
 
         def _factory() -> "MimiCodec":
             cfg = StaticMemoryCache.config().codec
             dev = device or StaticMemoryCache.device()
+            permit_dummy = (getattr(cfg, "allow_dummy", False)
+                            if allow_dummy is None else allow_dummy)
             try:
                 model = cls._load_moshi_mimi(cfg.hf_repo, cfg.num_codebooks, dev)
                 codec = cls(
@@ -69,8 +78,15 @@ class MimiCodec(nn.Module):
                 )
                 log.info("Loaded Mimi codec (%s) on %s", cfg.hf_repo, dev)
             except Exception as exc:  # pragma: no cover - depends on env
-                if not allow_dummy:
-                    raise
+                if not permit_dummy:
+                    raise RuntimeError(
+                        "Could not load the real Mimi codec and "
+                        "codec.allow_dummy=False, so training refuses to fall back "
+                        "to the pseudo-random DUMMY codec (it never converges). "
+                        "Install the real codec: `pip install moshi "
+                        "huggingface_hub` (and verify CUDA works — check "
+                        "`torch.cuda.get_arch_list()`). For CPU smoke tests set "
+                        f"codec.allow_dummy=true. Cause: {exc}") from exc
                 log.warning(
                     "Could not load real Mimi (%s). Falling back to DUMMY codec "
                     "for smoke testing. Install `moshi` for real audio.", exc)
