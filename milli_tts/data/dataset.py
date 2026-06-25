@@ -1,15 +1,19 @@
-"""Hugging Face TTS dataset adapter (IndicTTS-Hindi / IndicVoices).
+"""Hugging Face TTS dataset adapter (ai4bharat/IndicVoices, Hindi).
 
-Primary target: **SPRINGLab/IndicTTS-Hindi** — a clean studio TTS corpus whose
-rows carry only ``audio``, ``text`` (Devanagari Hindi) and ``gender`` (a
-``ClassLabel`` of ``female``/``male``). It has **no per-row speaker_id or lang**,
-so this adapter derives a stable speaker id from gender (``hi_female`` /
-``hi_male`` → two learned voice embeddings) and assumes the corpus language.
+Primary target: **ai4bharat/IndicVoices** (config ``hindi``) — a large *field*
+STT corpus (audio + ``normalized``/``verbatim`` transcript + ``speaker_id`` +
+``gender`` + ``lang`` + a per-row ``verification_report`` of QC flags). For TTS
+we invert the task — **text is the input, the spoken waveform is the target**.
 
-It also stays backward-compatible with **ai4bharat/IndicVoices**, an STT corpus
-(audio + ``normalized``/``text`` transcript + ``speaker_id`` + ``gender`` +
-``lang``). For TTS we simply invert the task — **text is the input, the spoken
-waveform is the target** — so STT labels are perfectly good TTS training pairs.
+Because IndicVoices is spontaneous speech (not studio TTS), two filters matter:
+* ``quality_filter`` drops noisy / mispronounced / text-mismatched clips using
+  the ``verification_report`` (see :data:`_BAD_QC_FLAGS`).
+* ``speaker_id_source="gender"`` collapses the many field speakers to a few
+  stable voices (``hi_female`` / ``hi_male``) so the conditioning trains well.
+
+It stays backward-compatible with single-language TTS corpora such as
+**SPRINGLab/IndicTTS-Hindi** (``audio`` + ``text`` + ``gender``, no per-row
+``lang``), which fall back to ``default_lang`` and the gender-derived speaker.
 
 This class yields lightweight per-utterance samples:
 
@@ -29,7 +33,9 @@ map-style mode.
 
 from __future__ import annotations
 
+import ast
 import os
+import re
 from typing import Dict, Iterator, Optional
 
 import torch
@@ -44,8 +50,35 @@ from milli_tts.utils.audio import load_audio, resample
 log = get_logger("data.dataset")
 
 # Candidate column names (IndicVoices variants differ slightly across configs).
+# `normalized` is the cleaned transcript (no [uhh]/[horn] disfluency tags);
+# prefer it over `verbatim`/`unsanitized_*`.
 _TEXT_FIELDS = ("normalized", "text", "verbatim", "sentence")
 _SPEAKER_FIELDS = ("speaker_id", "speaker", "client_id")
+
+# Inline annotation tags that survive in some transcripts, in TWO bracket
+# styles: square "[uhh]"/"[horn]" and angle "<breathing>"/"<inhaling>"/
+# "<Persistent-noise-start>". Stripped so the model never "speaks" a tag.
+_TAG_RE = re.compile(r"\[[^\]]*\]|<[^>]*>")
+
+# IndicVoices verification_report flags that make a clip unfit for TTS — either
+# the AUDIO is bad (noise / echo / unclear / low volume / chatter) or the TEXT
+# does not match the audio (skipping / repeating / wrong prompt / reading it),
+# or the SPEAKER label is wrong (wrong_gender / duplicate_speaker — these poison
+# per-speaker conditioning). Training on these is what produces garbled speech.
+_BAD_QC_FLAGS = (
+    "unclear_audio", "noise_persistent", "noise_intermittent", "echo_present",
+    "low_volume", "chatter_persistent", "chatter_intermittent",
+    "mispronunciation", "wrong_language", "stretching", "skipping_words",
+    "repeating_content", "incorrect_text_prompt", "reading_prompt",
+    "bad_extempore_quality", "wrong_gender", "duplicate_speaker",
+)
+# Overall human decision, best -> worst. Unknown values rank high (= keep).
+_DECISION_RANK = {"excellent": 3, "good": 2, "average": 1, "poor": 0}
+
+
+def _clean_text(text: str) -> str:
+    """Drop bracketed/angle disfluency+noise tags and collapse whitespace."""
+    return " ".join(_TAG_RE.sub(" ", text).split())
 
 # IndicVoices is organised as one HF *config per language*. Map the short
 # language code (what each row's `lang` field carries, e.g. "hi") to that
@@ -105,6 +138,24 @@ class IndicVoicesDataset(IterableDataset):
         self.voice_bank = voice_bank or VoiceBank.from_config()
         self._hf_dataset = None
         self._gender_names = None  # filled from the gender ClassLabel feature
+        self._speaker_names = None  # filled if speaker_id is a ClassLabel
+
+        # ---- quality + speaker policy -------------------------------- #
+        self.is_indicvoices = "indicvoices" in str(self.hf.dataset_repo).lower()
+        self.quality_filter = bool(getattr(self.hf, "quality_filter", False))
+        self.min_decision_rank = _DECISION_RANK.get(
+            str(getattr(self.hf, "min_quality_decision", "good")).lower(), 2)
+        # "row" -> one learned embedding per raw speaker_id (real per-speaker
+        # voices, what inference selects); "gender" -> collapse to hi_female/
+        # hi_male.
+        self.speaker_id_source = str(
+            getattr(cfg.voice, "speaker_id_source", "row")).lower()
+        # Deterministic utterance-level train/val split: a row is VAL iff
+        # hash(speaker_id|text) % val_holdout_mod == 0 (≈1/mod held out). Keyed on
+        # the UTTERANCE (not the speaker) so val speakers are still seen in train
+        # — essential for the embedding-table conditioning to have a meaningful
+        # val loss. 0 disables (falls back to the take/skip prefix split).
+        self.val_holdout_mod = int(getattr(self.hf, "val_holdout_mod", 0) or 0)
 
         # ---- language selection -------------------------------------- #
         # `languages` from config decides which language(s) to keep.
@@ -115,7 +166,7 @@ class IndicVoicesDataset(IterableDataset):
         # language also auto-selects the matching `dataset_config`. This remap is
         # IndicVoices-specific — other corpora (e.g. SPRINGLab/IndicTTS-Hindi,
         # config "default") must keep their own config name, so gate it on repo.
-        is_indicvoices = "indicvoices" in str(self.hf.dataset_repo).lower()
+        is_indicvoices = self.is_indicvoices
         if is_indicvoices and len(self.allowed_langs) == 1:
             only = next(iter(self.allowed_langs))
             mapped = _LANG_CODE_TO_CONFIG.get(only)
@@ -154,14 +205,31 @@ class IndicVoicesDataset(IterableDataset):
                 ds = load_dataset(self.hf.dataset_repo, **kwargs)
         except Exception as exc:
             msg = str(exc).lower()
-            if any(k in msg for k in ("gated", "403", "401", "authenticated",
-                                       "access", "permission")):
+            # Layout-robust: some IndicVoices snapshots expose one HF *config per
+            # language* ("hindi"), others ship a single config with a per-row
+            # `lang` column. If the requested config name isn't valid, retry
+            # WITHOUT a config and lean on the per-row language filter instead —
+            # `allowed_langs` (= ["hi"]) still keeps it Hindi-only.
+            config_err = any(k in msg for k in (
+                "config name", "builderconfig", "unknown config",
+                "not a valid config", "available configs", "config_name",
+                "load_dataset_builder"))
+            if config_err and self.dataset_config:
+                log.warning("Config '%s' not valid for %s (%s) — retrying with "
+                            "no config and filtering by per-row lang=%s.",
+                            self.dataset_config, self.hf.dataset_repo, exc,
+                            sorted(self.allowed_langs) or "ALL")
+                self.dataset_config = None
+                ds = load_dataset(self.hf.dataset_repo, **kwargs)
+            elif any(k in msg for k in ("gated", "403", "401", "authenticated",
+                                        "access", "permission")):
                 raise RuntimeError(
                     f"Cannot access {self.hf.dataset_repo}: it is GATED. Open "
                     f"https://huggingface.co/datasets/{self.hf.dataset_repo} "
                     f"while logged in as the token owner and click 'Agree and "
                     f"access', then retry. Original error: {exc}") from exc
-            raise
+            else:
+                raise
         log.info("load_dataset() returned in %.1fs.", _time.time() - t0)
         # Decode audio OURSELVES (soundfile) instead of letting `datasets` use
         # torchcodec — torchcodec needs a matching FFmpeg/torch build that Colab
@@ -179,12 +247,20 @@ class IndicVoicesDataset(IterableDataset):
         feats = getattr(ds, "features", None)
         gfeat = feats.get("gender") if feats else None
         self._gender_names = list(getattr(gfeat, "names", None) or []) or None
+        # `speaker_id` may also be a ClassLabel (streams as an int). Capture its
+        # names so per-speaker conditioning maps the int back to the real id
+        # string (e.g. "S4259869900354210") instead of silently dropping it.
+        sfeat = feats.get("speaker_id") if feats else None
+        self._speaker_names = list(getattr(sfeat, "names", None) or []) or None
 
-        # Held-out validation split: a deterministic prefix of the stream. The
-        # validation set takes the first `val_size` rows; training skips them so
-        # the two are disjoint (no leakage). Requires no extra `validation`
-        # split, which this corpus doesn't ship.
-        if self.val_size > 0:
+        # Held-out validation split.
+        #  * val_holdout_mod>0 (default for IndicVoices): a deterministic
+        #    UTTERANCE-hash split applied per-row in _process_row_diag — disjoint,
+        #    representative across all speakers, and val speakers stay in train.
+        #    No take/skip here (the whole stream feeds both roles, filtered).
+        #  * else: legacy prefix split — first `val_size` rows are val, train
+        #    skips them.
+        if self.val_holdout_mod <= 0 and self.val_size > 0:
             if self.role == "val":
                 ds = ds.take(self.val_size)
             elif self.role == "train":
@@ -299,9 +375,70 @@ class IndicVoicesDataset(IterableDataset):
         sample, _ = self._process_row_diag(row)
         return sample
 
+    def _quality_ok(self, row: Dict) -> bool:
+        """IndicVoices QC gate: drop noisy / mismatched clips.
+
+        Reads the per-row ``verification_report`` (a dict, or a stringified
+        dict when streamed as text). Rows below ``min_quality_decision`` or with
+        any audio/text-mismatch flag set are rejected. No report -> keep (so
+        corpora without this column are unaffected).
+        """
+        if not (self.quality_filter and self.is_indicvoices):
+            return True
+        report = row.get("verification_report")
+        if report is None:
+            return True
+        if isinstance(report, str):
+            try:
+                report = ast.literal_eval(report)
+            except Exception:
+                return True
+        if not isinstance(report, dict):
+            return True
+        decision = str(report.get("decision", "")).strip().lower()
+        if decision and _DECISION_RANK.get(decision, 99) < self.min_decision_rank:
+            return False
+        return not any(report.get(flag) is True for flag in _BAD_QC_FLAGS)
+
+    def _is_val_row(self, speaker_id: str, text: str) -> bool:
+        """Deterministic per-utterance val membership: ``hash(spk|text)%mod==0``."""
+        import hashlib
+        key = f"{speaker_id}|{text}".encode("utf-8")
+        h = int.from_bytes(hashlib.blake2b(key, digest_size=8).digest(), "big")
+        return (h % self.val_holdout_mod) == 0
+
+    def _speaker_name(self, value) -> Optional[str]:
+        """Normalize a speaker_id cell to its string id (decode ClassLabel ints)."""
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, str):
+            return value.strip() or None
+        try:
+            idx = int(value)
+        except (TypeError, ValueError):
+            return None
+        if self._speaker_names and 0 <= idx < len(self._speaker_names):
+            return str(self._speaker_names[idx]).strip()
+        return str(idx)
+
+    def _row_speaker_id(self, row: Dict, lang_code: str, gender) -> str:
+        """Resolve the speaker_id used for conditioning, per `speaker_id_source`."""
+        if self.speaker_id_source == "gender":
+            return f"{lang_code or 'hi'}_{gender or 'unknown'}"
+        raw = row.get("speaker_id")
+        if raw is None:
+            raw = row.get("speaker") if row.get("speaker") is not None \
+                else row.get("client_id")
+        sid = self._speaker_name(raw)
+        return sid or f"{lang_code or 'spk'}_{gender or 'unknown'}"
+
     def _process_row_diag(self, row: Dict):
         """Like _process_row but also returns a short skip reason for diagnostics."""
         text = self._pick(row, _TEXT_FIELDS)
+        if not text:
+            return None, "no_text"
+        # Strip residual [uhh]/<breathing>/<noise> tags from the transcript.
+        text = _clean_text(text)
         if not text:
             return None, "no_text"
 
@@ -315,6 +452,31 @@ class IndicVoicesDataset(IterableDataset):
         if self.allowed_langs and lang_code not in self.allowed_langs:
             return None, "wrong_lang"
 
+        # Quality gate (cheap, before the expensive audio decode).
+        if not self._quality_ok(row):
+            return None, "low_quality"
+
+        gender = self._gender_name(row.get("gender"))
+        # Speaker identity (real per-speaker id when speaker_id_source="row").
+        speaker_id = self._row_speaker_id(row, lang_code, gender)
+
+        # Train/val routing (cheap, BEFORE decode): keep only this role's rows.
+        if self.val_holdout_mod > 0:
+            is_val = self._is_val_row(speaker_id, text)
+            if self.role == "train" and is_val:
+                return None, "held_out_val"
+            if self.role == "val" and not is_val:
+                return None, "not_val"
+
+        # Cheap duration pre-filter on the `duration` column (skip decode if it's
+        # already out of range). The exact length is recomputed from the wav.
+        dfield = row.get("duration")
+        if isinstance(dfield, (int, float)) and dfield > 0:
+            if dfield < self.min_sec:
+                return None, "too_short"
+            if dfield > self.max_sec:
+                return None, "too_long"
+
         wav = self._extract_wav(row)
         if wav is None or wav.numel() == 0:
             return None, "no_audio"
@@ -324,13 +486,6 @@ class IndicVoicesDataset(IterableDataset):
         if dur > self.max_sec:
             return None, "too_long"
 
-        gender = self._gender_name(row.get("gender"))
-        # Speaker identity: use an explicit speaker_id when the corpus has one;
-        # otherwise derive a stable id from (lang, gender) — IndicTTS-Hindi then
-        # yields exactly two voices ("hi_female"/"hi_male").
-        speaker_id = self._pick(row, _SPEAKER_FIELDS)
-        if not speaker_id:
-            speaker_id = f"{lang_code or 'spk'}_{gender or 'unknown'}"
         if self.register_voices:
             spk_index = self.voice_bank.add_or_get(speaker_id, gender=gender,
                                                    lang=lang_code)
@@ -351,6 +506,48 @@ class IndicVoicesDataset(IterableDataset):
             "lang": lang_code or "",
             "duration": float(dur),
         }, "ok"
+
+    # ------------------------------------------------------------------ #
+    def iter_metadata(self, max_rows: Optional[int] = None):
+        """Yield ``(speaker_id, gender, lang_code, is_val)`` for quality-passing
+        rows WITHOUT decoding audio.
+
+        Used by ``tools/build_dataset.py`` to pre-build the speaker catalog and
+        count the train/val split cheaply. Drops the audio column up front so we
+        never pay the soundfile decode while cataloguing.
+        """
+        if self._hf_dataset is None:
+            self._hf_dataset = self._build_hf_dataset()
+        ds = self._hf_dataset
+        audio_col = self._find_audio_col(ds)
+        try:
+            if audio_col and hasattr(ds, "remove_columns"):
+                ds = ds.remove_columns([audio_col])
+        except Exception:
+            pass
+        seen = 0
+        for row in ds:
+            seen += 1
+            if max_rows and seen > max_rows:
+                break
+            text = self._pick(row, _TEXT_FIELDS)
+            if not text:
+                continue
+            text = _clean_text(text)
+            if not text:
+                continue
+            lang = row.get("lang") or self.default_lang
+            lang_code = str(lang).strip().lower()
+            lang_code = _CONFIG_TO_LANG_CODE.get(lang_code, lang_code)
+            if self.allowed_langs and lang_code not in self.allowed_langs:
+                continue
+            if not self._quality_ok(row):
+                continue
+            gender = self._gender_name(row.get("gender"))
+            speaker_id = self._row_speaker_id(row, lang_code, gender)
+            is_val = (self.val_holdout_mod > 0
+                      and self._is_val_row(speaker_id, text))
+            yield speaker_id, gender, lang_code, is_val
 
     # ------------------------------------------------------------------ #
     def __iter__(self) -> Iterator[Dict]:

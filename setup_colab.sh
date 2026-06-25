@@ -74,6 +74,53 @@ print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
 python -c "import torchaudio; print('torchaudio', torchaudio.__version__, 'OK')" \
   || echo '    WARN: torchaudio failed to load; continuing (librosa/soundfile fallback active).'
 
+# ── Hindi-ONLY dataset (ai4bharat/IndicVoices) ───────────────────────────────
+# This project trains on Hindi ONLY. With dataset_config="hindi" + streaming the
+# pipeline never fetches or stores any other language. This step (a) confirms
+# the gated dataset is reachable with your token, and (b) — when PREFETCH_HINDI=1
+# — downloads ONLY the Hindi shards to the HF cache (no other language on disk).
+echo "==> Verifying Hindi-only IndicVoices access (ai4bharat/IndicVoices)…"
+python - <<'PY' || echo "    WARN: Hindi access check failed — set HF_TOKEN and accept the terms at https://huggingface.co/datasets/ai4bharat/IndicVoices"
+import os
+tok = os.environ.get("HF_TOKEN")
+from datasets import load_dataset
+def _open(cfg):
+    return load_dataset("ai4bharat/IndicVoices", cfg, split="train",
+                        streaming=True, token=tok)
+try:
+    ds = _open("hindi")            # per-language config layout
+except Exception as e:
+    print("    (config 'hindi' unavailable:", str(e)[:120], "— using lang filter)")
+    ds = _open(None)              # single-config layout w/ a per-row `lang`
+row = next(iter(ds))
+print("    OK — Hindi stream is live. First-row columns:", list(row.keys())[:12])
+PY
+
+if [ "${PREFETCH_HINDI:-0}" = "1" ]; then
+  echo "==> PREFETCH_HINDI=1 -> downloading ONLY the Hindi shards (no other language)…"
+  python - <<'PY' || echo "    WARN: Hindi prefetch failed (training still works via streaming)."
+import os
+from huggingface_hub import snapshot_download
+tok = os.environ.get("HF_TOKEN")
+# Mirrors the HF tree https://huggingface.co/datasets/ai4bharat/IndicVoices/tree/main/hindi
+path = snapshot_download(
+    repo_id="ai4bharat/IndicVoices", repo_type="dataset", token=tok,
+    allow_patterns=["*[Hh]indi*", "**/[Hh]indi/**", "data/[Hh]indi/*", "hindi/*"])
+print("    Hindi data cached at:", path)
+PY
+else
+  echo "    (streaming Hindi during training; set PREFETCH_HINDI=1 to pre-download)"
+fi
+
+# Build the "perfect dataset": the per-speaker catalog (collision-free voice
+# indices, so inference can pick any Hindi speaker_id) + the deterministic
+# train/val split sizes. Reads metadata only — no audio decode. Capped by
+# CATALOG_MAX_ROWS (default 30000) to keep setup snappy; run
+# `python tools/build_dataset.py --max-rows 0` for a full pass.
+echo "==> Building Hindi speaker catalog + train/val split…"
+python tools/build_dataset.py --max-rows "${CATALOG_MAX_ROWS:-30000}" \
+  || echo "    WARN: catalog build skipped/failed — training still works (speaker indices fall back to hashing)."
+
 echo "==> Running CPU smoke test (dummy codec, tiny model)…"
 python -m tests.smoke_test || echo 'smoke test skipped/failed (non-fatal)'
 

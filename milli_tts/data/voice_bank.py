@@ -131,6 +131,36 @@ class VoiceBank:
                 entry.lang = lang
             return entry.index
 
+    def register_sequential(self, speaker_id: str, *, gender: Optional[str] = None,
+                            lang: Optional[str] = None) -> int:
+        """Assign a DENSE, collision-free index (next free slot).
+
+        Used by ``tools/build_dataset.py`` to pre-build the full speaker catalog
+        from a known, sorted id list. Unlike :meth:`add_or_get` (which hashes for
+        DDP order-independence and so can collide above ~√max_speakers ids), this
+        guarantees every speaker_id gets its own embedding row — what you want
+        for real per-speaker voices. Feed ids in sorted order for determinism.
+        """
+        with self._lock:
+            entry = self._entries.get(speaker_id)
+            if entry is None:
+                nxt = 1 + max((e.index for e in self._entries.values()),
+                              default=-1)
+                if nxt >= self.max_speakers:
+                    log.warning(
+                        "Speaker catalog hit max_speakers=%d at '%s'; raise "
+                        "voice.max_speakers so every speaker gets its own row.",
+                        self.max_speakers, speaker_id)
+                entry = VoiceEntry(speaker_id=speaker_id, index=nxt,
+                                   gender=gender, lang=lang)
+                self._entries[speaker_id] = entry
+            entry.num_utterances += 1
+            if gender and not entry.gender:
+                entry.gender = gender
+            if lang and not entry.lang:
+                entry.lang = lang
+            return entry.index
+
     def index_of(self, speaker_id: str) -> int:
         if speaker_id not in self._entries:
             raise KeyError(

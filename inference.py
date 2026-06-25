@@ -2,8 +2,8 @@
 """milli_tts inference entrypoint.
 
     # one-shot
-    python inference.py --voice S4259699400335456 \
-        --text "সময়মতে ডেলিভাৰী দিয়াৰ বাবে বহুত ভাল লাগিল" --out out.wav
+    python inference.py --voice hi_female \
+        --text "आज का दिन बहुत सुंदर है।" --out out.wav
 
     # interactive (prompts for voice_id + text in a loop)
     python inference.py --interactive

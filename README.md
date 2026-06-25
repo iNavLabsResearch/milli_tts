@@ -34,12 +34,19 @@ prev audio frame codes ─────┘        (causal: audio attends to all t
   what makes T4 training feasible and inference fast (12.5 Hz frame rate).
 * **`voice_id` lives in the conditioning, not in Mimi.** A pretrained codec has
   no speaker concept, so we build the speaker catalog ourselves:
-  * `EmbeddingTableConditioner` — every IndicVoices `speaker_id` (~400 of them)
-    gets a learned embedding. Pass `voice_id="S4259699400335456"` at inference.
+  * `EmbeddingTableConditioner` — a learned embedding per voice. By default
+    (`voice.speaker_id_source="row"`) every IndicVoices Hindi `speaker_id` (e.g.
+    `S4259869900354210`) gets its own embedding. `tools/build_dataset.py`
+    pre-assigns a **dense, collision-free index** per speaker so training and
+    inference agree and no two voices share a row. Pass that id as `--voice` at
+    inference; `--list-voices` shows the catalog.
   * `PrefixConditioner` — feed a ~10 s reference clip to clone an **unseen**
     voice zero-shot.
 * **Yes, STT data trains TTS.** Inverting the task (text → waveform) is exactly
-  delayed-streams TTS. 400 speakers is a *feature*: each becomes a `voice_id`.
+  delayed-streams TTS — but IndicVoices is *spontaneous field speech*, so we
+  keep only clean clips: `huggingface.quality_filter` drops rows whose
+  `verification_report` is noisy / echoey / mispronounced / text-mismatched or
+  below `min_quality_decision`. This is the biggest single TTS-quality lever.
 
 ---
 
@@ -82,17 +89,23 @@ import os
 os.environ["HF_TOKEN"]      = "hf_..."
 os.environ["WANDB_API_KEY"] = "..."
 
+!python tools/build_dataset.py         # Hindi speaker catalog + train/val split
 !python train.py                       # live graphs in W&B
 ```
+
+`setup_colab.sh` already runs the catalog build and detects the GPU (Blackwell
+sm_120 → cu128 wheels; Turing T4 / Pascal P100 on Colab+Kaggle → cu124 + fp16).
+For a full Hindi download instead of streaming: `PREFETCH_HINDI=1 bash
+setup_colab.sh`.
 
 Inference:
 
 ```bash
 python inference.py --interactive                      # prompts voice_id + text
-python inference.py --voice S4259699400335456 \
-                    --text "সময়মতে ডেলিভাৰী দিয়াৰ বাবে বহুত ভাল লাগিল" \
+python inference.py --voice S4259869900354210 \
+                    --text "आज का दिन बहुत सुंदर है।" \
                     --out out.wav
-python inference.py --list-voices
+python inference.py --list-voices                      # Hindi speaker_ids from the catalog
 # zero-shot clone an unseen speaker:
 python inference.py --register-voice myvoice --reference ref.wav \
                     --voice myvoice --text "Hello world" --out hello.wav

@@ -100,8 +100,8 @@ class PathsConfig:
 @dataclass(frozen=True)
 class HuggingFaceConfig:
     token: Optional[str] = None
-    dataset_repo: str = "SPRINGLab/IndicTTS-Hindi"
-    dataset_config: Optional[str] = "default"
+    dataset_repo: str = "ai4bharat/IndicVoices"
+    dataset_config: Optional[str] = "hindi"
     dataset_split: str = "train"
     streaming: bool = True
     push_to_hub: bool = False
@@ -122,6 +122,21 @@ class HuggingFaceConfig:
     # 0 disables. Memory ≈ buffer_size × avg encoded-audio-row bytes, so lower it
     # on small-RAM hosts. Train only — the val set stays a deterministic prefix.
     shuffle_buffer_size: int = 10000
+    # IndicVoices ships a per-row `verification_report` (a dict of QC flags +
+    # an overall `decision`). When True we DROP rows that are noisy / echoey /
+    # mispronounced / text-mismatched or whose decision is below
+    # `min_quality_decision` — this is the single biggest TTS-quality lever on
+    # IndicVoices, which is spontaneous *field* speech, not studio TTS.
+    quality_filter: bool = True
+    # Lowest acceptable `verification_report.decision`. Order (best→worst):
+    # excellent > good > average > poor. "good" keeps excellent+good.
+    min_quality_decision: str = "good"
+    # Deterministic utterance-level train/val split: a row is held out for
+    # validation iff hash(speaker_id|text) % val_holdout_mod == 0 (so ≈1/mod is
+    # val). Keyed on the utterance (not the speaker) so val speakers still appear
+    # in train — required for the per-speaker embedding to have a real val loss.
+    # 0 = use the legacy first-`eval_samples`-rows prefix split instead.
+    val_holdout_mod: int = 20
 
 
 @dataclass(frozen=True)
@@ -153,12 +168,15 @@ class TokenizerConfig:
 @dataclass(frozen=True)
 class ModelConfig:
     arch: str = "rq_transformer_tts"
-    d_model: int = 1024
-    backbone_layers: int = 12
-    backbone_heads: int = 16
-    depth_layers: int = 6
-    depth_heads: int = 8
-    depth_dim: int = 1024
+    # Pocket-TTS class (~110M). A from-scratch model has to *converge* inside the
+    # ~6k-step budget, so it is deliberately small: a 250M model never leaves the
+    # babble stage in 6k steps, a ~110M one starts forming words.
+    d_model: int = 768
+    backbone_layers: int = 8
+    backbone_heads: int = 12
+    depth_layers: int = 4
+    depth_heads: int = 12
+    depth_dim: int = 768
     ffn_mult: int = 4
     dropout: float = 0.0
     rope_theta: float = 10000.0
@@ -174,11 +192,22 @@ class ModelConfig:
 @dataclass(frozen=True)
 class VoiceConfig:
     strategy: str = "embedding_table"
-    embedding_dim: int = 1024
-    max_speakers: int = 2048
+    embedding_dim: int = 768
+    # Sized to comfortably exceed the IndicVoices-Hindi speaker count so the
+    # pre-built catalog (tools/build_dataset.py) gets a dense, collision-free
+    # index per speaker. The table is cheap (max_speakers × embedding_dim).
+    max_speakers: int = 8192
     reference_clip_seconds: float = 10.0
     allow_zero_shot_prefix: bool = True
-    default_voice_id: str = "S4259699400335456"
+    # How to derive a speaker identity from each row:
+    #   "row"    — one learned embedding per raw `speaker_id` (real per-speaker
+    #     voices; this is what inference selects via voice_id). Use the
+    #     pre-built speaker catalog so every id gets a stable, unique index.
+    #   "gender" — collapse to (lang, gender) -> "hi_female"/"hi_male".
+    speaker_id_source: str = "row"
+    # A real IndicVoices-Hindi speaker_id (from the catalog) used when no
+    # voice_id is passed at inference.
+    default_voice_id: str = "S4259869900354210"
 
 
 @dataclass(frozen=True)
@@ -186,32 +215,36 @@ class TrainingConfig:
     device: str = "auto"
     precision: str = "bf16"
     fallback_precision: str = "fp16"
-    batch_size: int = 8
+    # Effective batch = batch_size × grad_accum_steps. Keep it large (≈64): a
+    # small effective batch is the #1 cause of the spiky "shark-fin" loss curve.
+    batch_size: int = 16
     grad_accum_steps: int = 4
-    max_steps: int = 200000
-    warmup_steps: int = 2000
-    lr: float = 3e-4
+    max_steps: int = 6000
+    warmup_steps: int = 600
+    lr: float = 2e-4
     min_lr: float = 1e-5
     weight_decay: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
-    # Cross-entropy label smoothing (0 disables). Regularizes the per-codebook
-    # softmax to reduce over-confidence and smooth training.
+    # Cross-entropy label smoothing (0 disables). Kept at 0 so train/val report
+    # the SAME, true cross-entropy — label smoothing on a 2048-way codebook
+    # softmax inflates the loss and makes the curve jitter.
     label_smoothing: float = 0.0
     lr_schedule: str = "cosine"
     gradient_checkpointing: bool = True
-    num_workers: int = 2
-    log_every: int = 20
-    eval_every: int = 1000
-    save_every: int = 2000
+    num_workers: int = 4
+    log_every: int = 25
+    eval_every: int = 250
+    save_every: int = 1000
     keep_last_n_checkpoints: int = 3
     resume_from: str = "latest"
-    max_audio_seconds: float = 20.0
+    max_audio_seconds: float = 12.0
     min_audio_seconds: float = 1.0
     compile_model: bool = False
     # Size of the held-out validation set (stream prefix) for periodic val loss.
-    eval_samples: int = 256
+    # Bigger + less-frequent eval = a smooth val curve instead of a noisy one.
+    eval_samples: int = 128
 
 
 @dataclass(frozen=True)

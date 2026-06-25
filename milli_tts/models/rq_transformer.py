@@ -102,6 +102,12 @@ class RQTransformerTTS(BaseTTSModel):
              for _ in range(num_codebooks)])
 
         self.apply(self._init_weights)
+        # Scale every residual output projection by 1/sqrt(2*n_layers) (GPT-2 /
+        # nanoGPT). Without it the residual stream's variance grows with depth,
+        # which is a classic source of the early-training loss SPIKES this model
+        # showed — the fix keeps activations well-conditioned from step 0.
+        self._scale_residual_init(self.backbone, model_cfg.backbone_layers)
+        self._scale_residual_init(self.depth, model_cfg.depth_layers)
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -112,6 +118,15 @@ class RQTransformerTTS(BaseTTSModel):
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, std=0.02)
+
+    @staticmethod
+    def _scale_residual_init(stack, n_layers: int) -> None:
+        """Down-scale the per-block output projections (attn.proj, mlp.w3)."""
+        scale = (2.0 * max(1, n_layers)) ** -0.5
+        for block in stack.blocks:
+            with torch.no_grad():
+                block.attn.proj.weight.mul_(scale)
+                block.mlp.w3.weight.mul_(scale)
 
     # ------------------------------------------------------------------ #
     # Embedding helpers

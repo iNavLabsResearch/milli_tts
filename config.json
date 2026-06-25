@@ -3,7 +3,7 @@
     "name": "milli_tts",
     "repo": "iNavLabsResearch/milli_tts",
     "seed": 1337,
-    "run_name": "milli-tts-indic-v1"
+    "run_name": "milli-tts-hindi-v2"
   },
 
   "paths": {
@@ -20,15 +20,19 @@
 
   "huggingface": {
     "token": "REV:SueqOSPqunzpeCdQGcpfIlyvKMGHcHIYBh_fh",
-    "dataset_repo": "SPRINGLab/IndicTTS-Hindi",
-    "dataset_config": "default",
+    "dataset_repo": "ai4bharat/IndicVoices",
+    "dataset_config": "hindi",
     "dataset_split": "train",
     "streaming": true,
     "push_to_hub": false,
     "model_hub_repo": "iNavLabsResearch/milli-tts-indic",
     "push_checkpoints_to_hub": true,
     "checkpoint_repo": "milli_tts_weights",
-    "languages": ["hi"]
+    "languages": ["hi"],
+    "shuffle_buffer_size": 10000,
+    "quality_filter": true,
+    "min_quality_decision": "good",
+    "val_holdout_mod": 20
   },
 
   "codec": {
@@ -53,12 +57,12 @@
 
   "model": {
     "arch": "rq_transformer_tts",
-    "d_model": 1024,
-    "backbone_layers": 12,
-    "backbone_heads": 16,
-    "depth_layers": 6,
-    "depth_heads": 8,
-    "depth_dim": 1024,
+    "d_model": 768,
+    "backbone_layers": 8,
+    "backbone_heads": 12,
+    "depth_layers": 4,
+    "depth_heads": 12,
+    "depth_dim": 768,
     "ffn_mult": 4,
     "dropout": 0.0,
     "rope_theta": 10000.0,
@@ -73,38 +77,39 @@
 
   "voice": {
     "strategy": "embedding_table",
-    "embedding_dim": 1024,
-    "max_speakers": 2048,
+    "embedding_dim": 768,
+    "max_speakers": 8192,
     "reference_clip_seconds": 10.0,
     "allow_zero_shot_prefix": true,
-    "default_voice_id": "hi_female"
+    "speaker_id_source": "row",
+    "default_voice_id": "S4259869900354210"
   },
 
   "training": {
     "device": "auto",
     "precision": "bf16",
     "fallback_precision": "fp16",
-    "batch_size": 8,
-    "grad_accum_steps": 2,
-    "max_steps": 8000,
-    "warmup_steps": 1000,
-    "lr": 0.0003,
+    "batch_size": 16,
+    "grad_accum_steps": 4,
+    "max_steps": 6000,
+    "warmup_steps": 600,
+    "lr": 0.0002,
     "min_lr": 0.00001,
     "weight_decay": 0.1,
     "beta1": 0.9,
     "beta2": 0.95,
     "grad_clip": 1.0,
-    "label_smoothing": 0.1,
+    "label_smoothing": 0.0,
     "lr_schedule": "cosine",
     "gradient_checkpointing": true,
     "num_workers": 4,
-    "log_every": 5,
-    "eval_every": 10,
-    "eval_samples": 64,
-    "save_every": 500,
+    "log_every": 25,
+    "eval_every": 250,
+    "eval_samples": 128,
+    "save_every": 1000,
     "keep_last_n_checkpoints": 3,
     "resume_from": "latest",
-    "max_audio_seconds": 15.0,
+    "max_audio_seconds": 12.0,
     "min_audio_seconds": 1.0,
     "compile_model": false
   },
@@ -116,7 +121,7 @@
     "entity": null,
     "mode": "online",
     "log_audio_samples": true,
-    "audio_sample_every": 2000,
+    "audio_sample_every": 1000,
     "watch_model": false
   },
 
