@@ -42,10 +42,21 @@ def pull_latest_checkpoint() -> str:
     from huggingface_hub import HfApi, hf_hub_download
 
     cfg = StaticMemoryCache.config()
-    repo = cfg.huggingface.checkpoint_repo
+    raw_repo = cfg.huggingface.checkpoint_repo
     token = cfg.huggingface.token
 
     api = HfApi(token=token)
+
+    # checkpoint_repo in config may be a bare name ("milli_tts_weights") —
+    # resolve it to the full "owner/repo" via the authenticated user, matching
+    # what hf_sync.py's create_repo() does during training.
+    if "/" not in raw_repo:
+        user = api.whoami(token=token)["name"]
+        repo = f"{user}/{raw_repo}"
+        log.info("Resolved checkpoint repo -> %s", repo)
+    else:
+        repo = raw_repo
+
     files = api.list_repo_files(repo, repo_type="model")
     latest_files = sorted(
         [f for f in files if f.endswith("/latest.pt")], reverse=True)
