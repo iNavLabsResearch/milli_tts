@@ -241,8 +241,9 @@ class Trainer:
                         "train/step": self.step,
                     }
                     self.tracker.log(metrics, step=self.step)
-                    log.info("step %d | loss %.4f | acc %.3f | lr %.2e | %.2f it/s",
-                             self.step, avg, out["acc"].item(), lr, sps)
+                    log.info("step %d | loss %.4f | acc %.3f | acc_cb0 %.3f | "
+                             "lr %.2e | %.2f it/s", self.step, avg,
+                             out["acc"].item(), out["acc_cb0"].item(), lr, sps)
 
                 if self.step % self.tcfg.save_every == 0:
                     self._save(out_loss=out["loss"].item())

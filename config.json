@@ -21,11 +21,12 @@
   "huggingface": {
     "token": "REV:SueqOSPqunzpeCdQGcpfIlyvKMGHcHIYBh_fh",
     "dataset_repo": "ai4bharat/IndicVoices",
-    "dataset_config": "assamese",
+    "dataset_config": "hindi",
     "dataset_split": "train",
     "streaming": true,
     "push_to_hub": false,
-    "model_hub_repo": "iNavLabsResearch/milli-tts-indic"
+    "model_hub_repo": "iNavLabsResearch/milli-tts-indic",
+    "languages": ["hi"]
   },
 
   "codec": {
@@ -81,9 +82,9 @@
     "precision": "bf16",
     "fallback_precision": "fp16",
     "batch_size": 8,
-    "grad_accum_steps": 4,
+    "grad_accum_steps": 2,
     "max_steps": 200000,
-    "warmup_steps": 2000,
+    "warmup_steps": 500,
     "lr": 0.0003,
     "min_lr": 0.00001,
     "weight_decay": 0.1,
@@ -92,13 +93,13 @@
     "grad_clip": 1.0,
     "lr_schedule": "cosine",
     "gradient_checkpointing": true,
-    "num_workers": 0,
+    "num_workers": 4,
     "log_every": 5,
     "eval_every": 1000,
     "save_every": 2000,
     "keep_last_n_checkpoints": 3,
     "resume_from": "latest",
-    "max_audio_seconds": 20.0,
+    "max_audio_seconds": 15.0,
     "min_audio_seconds": 1.0,
     "compile_model": false
   },

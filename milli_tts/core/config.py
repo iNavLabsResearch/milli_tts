@@ -101,11 +101,16 @@ class PathsConfig:
 class HuggingFaceConfig:
     token: Optional[str] = None
     dataset_repo: str = "ai4bharat/IndicVoices"
-    dataset_config: str = "assamese"
+    dataset_config: str = "hindi"
     dataset_split: str = "train"
     streaming: bool = True
     push_to_hub: bool = False
     model_hub_repo: str = "iNavLabsResearch/milli-tts-indic"
+    # Languages to keep (ISO codes like "hi"/"as" or names like "hindi").
+    # IndicVoices ships one HF config per language, so a single entry here also
+    # auto-selects the matching `dataset_config`. Empty list or ["all"] = keep
+    # every language in the configured split.
+    languages: List[str] = field(default_factory=lambda: ["hi"])
 
 
 @dataclass(frozen=True)

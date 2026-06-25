@@ -133,18 +133,26 @@ class RQTransformerTTS(BaseTTSModel):
         frame is BOS).
         """
         b, lt = text_ids.shape
-        ta = audio_in.shape[-1]
         spk = self.conditioner(speaker_index)  # [B, D]
 
         text_h = self.text_emb(text_ids) + self.type_emb.weight[0]  # [B, Lt, D]
 
-        audio_h = []
-        for t in range(ta):
-            audio_h.append(self._embed_audio_frame(audio_in[:, :, t]))
-        audio_h = torch.stack(audio_h, dim=1)  # [B, Ta, D]
+        # Vectorized over time: sum the Q per-codebook embeddings for ALL frames
+        # at once (Q embedding lookups total, not Q*Ta). audio_in: [B, Q, Ta].
+        audio_h = self._embed_audio_seq(audio_in)  # [B, Ta, D]
         audio_h = audio_h + self.type_emb.weight[1] + spk.unsqueeze(1)
 
         return torch.cat([text_h, audio_h], dim=1)  # [B, Lt+Ta, D]
+
+    def _embed_audio_seq(self, codes: torch.Tensor) -> torch.Tensor:
+        """Sum per-codebook embeddings over a whole frame sequence.
+
+        codes: ``[B, Q, Ta]`` -> ``[B, Ta, D]``.
+        """
+        out = self.audio_in_emb[0](codes[:, 0, :])
+        for q in range(1, self.num_codebooks):
+            out = out + self.audio_in_emb[q](codes[:, q, :])
+        return out
 
     # ------------------------------------------------------------------ #
     # Depth transformer: predict Q codebooks from backbone hidden states

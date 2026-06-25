@@ -42,6 +42,36 @@ log = get_logger("data.dataset")
 _TEXT_FIELDS = ("normalized", "text", "verbatim", "sentence")
 _SPEAKER_FIELDS = ("speaker_id", "speaker", "client_id")
 
+# IndicVoices is organised as one HF *config per language*. Map the short
+# language code (what each row's `lang` field carries, e.g. "hi") to that
+# config name so a user can pick a language by code from config.json.
+_LANG_CODE_TO_CONFIG = {
+    "as": "assamese", "bn": "bengali", "brx": "bodo", "doi": "dogri",
+    "gu": "gujarati", "hi": "hindi", "kn": "kannada", "ks": "kashmiri",
+    "kok": "konkani", "mai": "maithili", "ml": "malayalam", "mni": "manipuri",
+    "mr": "marathi", "ne": "nepali", "or": "odia", "pa": "punjabi",
+    "sa": "sanskrit", "sat": "santali", "sd": "sindhi", "ta": "tamil",
+    "te": "telugu", "ur": "urdu",
+}
+_CONFIG_TO_LANG_CODE = {v: k for k, v in _LANG_CODE_TO_CONFIG.items()}
+
+
+def _normalize_langs(langs) -> set:
+    """Turn a config `languages` list into a set of canonical lang codes.
+
+    Returns an empty set to mean "keep everything" (no filter). Accepts codes
+    ("hi"), config names ("hindi") or the wildcards "all"/"any"/"*".
+    """
+    if not langs:
+        return set()
+    out: set = set()
+    for item in langs:
+        s = str(item).strip().lower()
+        if s in ("all", "any", "*", ""):
+            return set()
+        out.add(_CONFIG_TO_LANG_CODE.get(s, s))  # name -> code, else keep code
+    return out
+
 
 class IndicVoicesDataset(IterableDataset):
     def __init__(self, *, split: Optional[str] = None,
@@ -61,22 +91,38 @@ class IndicVoicesDataset(IterableDataset):
         self.voice_bank = voice_bank or VoiceBank.from_config()
         self._hf_dataset = None
 
+        # ---- language selection -------------------------------------- #
+        # `languages` from config decides which language(s) to keep. Because
+        # IndicVoices is one config per language, a single requested language
+        # also auto-selects the matching `dataset_config` (so editing
+        # `languages: ["hi"]` alone is enough — no stale config can leak the
+        # wrong language in).
+        self.allowed_langs = _normalize_langs(getattr(self.hf, "languages", None))
+        self.dataset_config = self.hf.dataset_config
+        if len(self.allowed_langs) == 1:
+            only = next(iter(self.allowed_langs))
+            mapped = _LANG_CODE_TO_CONFIG.get(only)
+            if mapped and mapped != self.dataset_config:
+                log.info("languages=['%s'] -> using IndicVoices config '%s' "
+                         "(was '%s')", only, mapped, self.dataset_config)
+                self.dataset_config = mapped
+
     # ------------------------------------------------------------------ #
     def _build_hf_dataset(self):
         import time as _time
 
         from datasets import Audio, load_dataset
 
-        log.info("Loading %s [config=%s split=%s streaming=%s] — this opens the "
-                 "stream (first shard fetch can take a minute)…",
-                 self.hf.dataset_repo, self.hf.dataset_config, self.split,
-                 self.hf.streaming)
+        log.info("Loading %s [config=%s split=%s streaming=%s] keep_langs=%s — "
+                 "this opens the stream (first shard fetch can take a minute)…",
+                 self.hf.dataset_repo, self.dataset_config, self.split,
+                 self.hf.streaming, sorted(self.allowed_langs) or "ALL")
         kwargs = dict(split=self.split, streaming=self.hf.streaming,
                       token=self.hf.token)
         t0 = _time.time()
         try:
-            if self.hf.dataset_config:
-                ds = load_dataset(self.hf.dataset_repo, self.hf.dataset_config,
+            if self.dataset_config:
+                ds = load_dataset(self.hf.dataset_repo, self.dataset_config,
                                   **kwargs)
             else:
                 ds = load_dataset(self.hf.dataset_repo, **kwargs)
@@ -183,6 +229,15 @@ class IndicVoicesDataset(IterableDataset):
         text = self._pick(row, _TEXT_FIELDS)
         if not text:
             return None, "no_text"
+
+        # Language filter FIRST (cheap, before decoding audio): drop rows whose
+        # language isn't in the configured allow-list.
+        lang = row.get("lang") or self.dataset_config
+        lang_code = str(lang).strip().lower()
+        lang_code = _CONFIG_TO_LANG_CODE.get(lang_code, lang_code)
+        if self.allowed_langs and lang_code not in self.allowed_langs:
+            return None, "wrong_lang"
+
         wav = self._extract_wav(row)
         if wav is None or wav.numel() == 0:
             return None, "no_audio"
@@ -194,7 +249,6 @@ class IndicVoicesDataset(IterableDataset):
 
         speaker_id = self._pick(row, _SPEAKER_FIELDS) or "unknown"
         gender = row.get("gender")
-        lang = row.get("lang") or self.hf.dataset_config
         if self.register_voices:
             spk_index = self.voice_bank.add_or_get(speaker_id, gender=gender,
                                                    lang=lang)
@@ -217,17 +271,23 @@ class IndicVoicesDataset(IterableDataset):
     def __iter__(self) -> Iterator[Dict]:
         if self._hf_dataset is None:
             self._hf_dataset = self._build_hf_dataset()
-        # Shard across DataLoader workers when streaming.
+        # Shard across DataLoader workers when streaming so each worker sees a
+        # DISJOINT slice (otherwise N workers would each replay the same rows).
         worker = torch.utils.data.get_worker_info()
         ds = self._hf_dataset
-        if worker is not None and self.hf.streaming:
-            ds = ds.shard(num_shards=worker.num_workers, index=worker.id) \
-                if hasattr(ds, "shard") else ds
+        stride, offset = 1, 0
+        if worker is not None and self.hf.streaming and worker.num_workers > 1:
+            if hasattr(ds, "shard"):
+                ds = ds.shard(num_shards=worker.num_workers, index=worker.id)
+            else:  # fallback: stride the iterator by worker id (no duplication)
+                stride, offset = worker.num_workers, worker.id
         wid = worker.id if worker is not None else 0
         seen = 0
         yielded = 0
         skip_reasons: Dict[str, int] = {}
         for i, row in enumerate(ds):
+            if stride > 1 and (i % stride) != offset:
+                continue
             if seen == 0:
                 # Dump the real columns once so field-mapping bugs are obvious.
                 log.info("[loader w%d] first row keys: %s", wid,
