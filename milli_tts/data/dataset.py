@@ -97,6 +97,10 @@ class IndicVoicesDataset(IterableDataset):
         # role="train" skips those same rows so the two never overlap.
         self.role = role
         self.val_size = int(val_size)
+        # Train-stream shuffle: seed (for reproducibility) + per-epoch counter so
+        # each pass over a small corpus is reshuffled instead of replayed in order.
+        self.seed = int(getattr(cfg.project, "seed", 1337))
+        self._epoch = 0
         self.tokenizer = tokenizer or TextTokenizer.from_config()
         self.voice_bank = voice_bank or VoiceBank.from_config()
         self._hf_dataset = None
@@ -185,6 +189,20 @@ class IndicVoicesDataset(IterableDataset):
                 ds = ds.take(self.val_size)
             elif self.role == "train":
                 ds = ds.skip(self.val_size)
+
+        # Break long contiguous speaker/length blocks in the train stream. Without
+        # this the model over-specializes to whatever block it's currently on,
+        # which surfaces as a growing per-epoch sawtooth in the (fixed) val
+        # metrics and wastes capacity on memorization. Reservoir shuffle over a
+        # buffer; reshuffled per epoch via set_epoch() in __iter__. Train only —
+        # val stays a deterministic, disjoint held-out prefix.
+        buf = int(getattr(self.hf, "shuffle_buffer_size", 0) or 0)
+        if (self.role == "train" and self.hf.streaming and buf > 0
+                and hasattr(ds, "shuffle")):
+            ds = ds.shuffle(seed=self.seed, buffer_size=buf)
+            log.info("Train stream shuffled (buffer_size=%d, seed=%d) — avoids "
+                     "block-ordered batches that cause the val sawtooth.",
+                     buf, self.seed)
 
         log.info("Stream ready (role=%s, audio col=%s, gender_names=%s, "
                  "self-decode). Pulling rows…", self.role, audio_col,
@@ -339,6 +357,13 @@ class IndicVoicesDataset(IterableDataset):
         if self._hf_dataset is None:
             self._hf_dataset = self._build_hf_dataset()
         ds = self._hf_dataset
+        # Reshuffle the streaming buffer each epoch (train only) so repeated
+        # passes over a small corpus don't replay an identical order and memorize
+        # it. No-op if the stream wasn't shuffled (buffer disabled / val role).
+        if (self.role == "train" and self.hf.streaming
+                and hasattr(ds, "set_epoch")):
+            ds.set_epoch(self._epoch)
+            self._epoch += 1
         # Shard the stream so each (DDP rank × DataLoader worker) sees a DISJOINT
         # slice — otherwise every GPU/worker would replay the same rows. Total
         # shards = world_size × num_workers; this worker's global shard index is

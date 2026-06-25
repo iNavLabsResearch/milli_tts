@@ -116,6 +116,12 @@ class HuggingFaceConfig:
     # auto-selects the matching `dataset_config`. Empty list or ["all"] = keep
     # every language in the configured split.
     languages: List[str] = field(default_factory=lambda: ["hi"])
+    # Reservoir-shuffle buffer over the streaming train iterator. Without it the
+    # model trains on long contiguous speaker/length blocks, which causes the
+    # periodic val sawtooth + per-epoch memorization. Reshuffled each epoch.
+    # 0 disables. Memory ≈ buffer_size × avg encoded-audio-row bytes, so lower it
+    # on small-RAM hosts. Train only — the val set stays a deterministic prefix.
+    shuffle_buffer_size: int = 10000
 
 
 @dataclass(frozen=True)
