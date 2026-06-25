@@ -84,6 +84,35 @@ def ensure_voice_bank():
     bank.save()
 
 
+def upload_samples_to_hf(wav_paths: list[str]) -> None:
+    """Push generated .wav files to the HF checkpoint repo under samples/."""
+    from huggingface_hub import HfApi
+
+    cfg = StaticMemoryCache.config()
+    raw_repo = cfg.huggingface.checkpoint_repo
+    token = cfg.huggingface.token
+    api = HfApi(token=token)
+
+    if "/" not in raw_repo:
+        user = api.whoami(token=token)["name"]
+        repo = f"{user}/{raw_repo}"
+    else:
+        repo = raw_repo
+
+    log.info("Uploading %d samples to hf://%s/samples/ …", len(wav_paths), repo)
+    for path in wav_paths:
+        name = os.path.basename(path)
+        api.upload_file(
+            path_or_fileobj=path,
+            path_in_repo=f"samples/{name}",
+            repo_id=repo,
+            repo_type="model",
+            commit_message=f"Add inference sample: {name}",
+        )
+        log.info("  pushed -> hf://%s/samples/%s", repo, name)
+    log.info("All samples uploaded to HF.")
+
+
 def main():
     bootstrap("config.json")
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -107,12 +136,13 @@ def main():
                      res.first_chunk_ms, res.real_time_factor)
             saved.append(out_path)
 
+    # ── upload samples to HF alongside the checkpoint weights ──────────
+    upload_samples_to_hf(saved)
+
     print(f"\n{'='*60}")
     print(f"Done. {len(saved)} files in {OUT_DIR}/:")
     for p in saved:
         print(f"  {os.path.basename(p)}")
-    print(f"\nTo download from a Docker container:")
-    print(f"  docker cp <container>:{OUT_DIR}/ ./hub_samples/")
     print(f"{'='*60}")
 
 
