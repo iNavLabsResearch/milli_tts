@@ -25,8 +25,16 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainingConfig):
         {"params": decay, "weight_decay": cfg.weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
     ]
-    return torch.optim.AdamW(groups, lr=cfg.lr, betas=(cfg.beta1, cfg.beta2),
-                             eps=1e-8)
+    kw = dict(lr=cfg.lr, betas=(cfg.beta1, cfg.beta2), eps=1e-8)
+    # Use the fused CUDA AdamW kernel when params live on GPU — it folds the
+    # whole optimizer step into one kernel (meaningfully faster than the Python
+    # for-loop path). Falls back gracefully on CPU/older torch.
+    if any(p.is_cuda for p in model.parameters()):
+        try:
+            return torch.optim.AdamW(groups, **kw, fused=True)
+        except (TypeError, RuntimeError):
+            pass
+    return torch.optim.AdamW(groups, **kw)
 
 
 class CosineWarmupSchedule:

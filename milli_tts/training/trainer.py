@@ -135,10 +135,19 @@ class Trainer:
         if self.device.type != "cuda":
             return torch.float32, False
         want = self.tcfg.precision.lower()
-        if want == "bf16" and torch.cuda.is_bf16_supported():
+        # bf16 is only *tensor-core accelerated* on Ampere+ (sm_80+). On Turing
+        # (T4 = sm_75) bf16 GEMMs fall off the tensor cores and run far slower
+        # than fp16 — so we transparently switch to fp16 (+ GradScaler) there,
+        # which lights up the T4's fp16 tensor cores. This is the single biggest
+        # throughput win on a T4.
+        cap = torch.cuda.get_device_capability(self.device)
+        bf16_fast = cap[0] >= 8 and torch.cuda.is_bf16_supported()
+        if want == "bf16" and bf16_fast:
             return torch.bfloat16, False
         if want == "bf16":
-            log.warning("bf16 unsupported on this GPU; using fp16 (good for T4).")
+            log.warning("bf16 is not tensor-core accelerated on sm_%d%d (e.g. "
+                        "T4) — using fp16 + GradScaler for ~1.5-2x faster GEMMs.",
+                        cap[0], cap[1])
             return torch.float16, True
         if want == "fp16":
             return torch.float16, True
