@@ -21,18 +21,40 @@ echo "==> Installing audio codecs (ffmpeg, libsndfile)…"
 # Fix: install torch + torchaudio *together* from one CUDA index with a single
 # `<2.10` constraint, so pip picks a co-released, ABI-matched pair whose wheels
 # actually exist on that index (no brittle hard-coded version).
+#
+# Picking the CUDA index:
+#   * Blackwell GPUs (sm_100/sm_120 — RTX 50-series, RTX PRO 6000, B200) need
+#     cu128 wheels (torch>=2.7). cu124 wheels only ship kernels up to sm_90 and
+#     crash with "no kernel image is available for execution on the device".
+#   * We detect the *live* GPU's compute capability via nvidia-smi first, because
+#     on a fresh box the installed torch may not know its CUDA version yet
+#     (chicken-and-egg). compute_cap is like "12.0" (Blackwell) / "9.0" (Hopper).
 CUDA_TAG=cu124
-DETECTED="$(python -c 'import torch; print((torch.version.cuda or "").replace(".",""))' 2>/dev/null || true)"
-case "${DETECTED}" in
-  128|127|126) CUDA_TAG=cu128 ;;
-  124|123|122|121) CUDA_TAG=cu124 ;;
-esac
-echo "    PyTorch index: ${CUDA_TAG} (detected cuda='${DETECTED}')"
+CC="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+        | head -n1 | tr -d ' ')"
+CC_MAJOR="${CC%%.*}"
+if [ -n "${CC_MAJOR}" ] && [ "${CC_MAJOR}" -ge 10 ] 2>/dev/null; then
+  # sm_100 / sm_120 -> Blackwell -> must use cu128.
+  CUDA_TAG=cu128
+else
+  # Fall back to whatever CUDA the currently-installed torch was built against.
+  DETECTED="$(python -c 'import torch; print((torch.version.cuda or "").replace(".",""))' 2>/dev/null || true)"
+  case "${DETECTED}" in
+    129|128|127|126) CUDA_TAG=cu128 ;;
+    124|123|122|121) CUDA_TAG=cu124 ;;
+  esac
+fi
+echo "    PyTorch index: ${CUDA_TAG} (gpu compute_cap='${CC:-?}')"
 if ! pip -q install "torch<2.10" "torchaudio<2.10" \
       --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"; then
-  echo "    cu-index install failed; retrying on cu124…"
+  # Retry the same index once (transient network), then — only for non-Blackwell —
+  # fall back to cu124. Never silently downgrade a Blackwell box to cu124: that
+  # reinstalls a wheel its GPU can't run.
+  echo "    install on ${CUDA_TAG} failed; retrying…"
+  FALLBACK_TAG="${CUDA_TAG}"
+  [ "${CUDA_TAG}" != "cu128" ] && FALLBACK_TAG=cu124
   pip -q install "torch<2.10" "torchaudio<2.10" \
-    --index-url "https://download.pytorch.org/whl/cu124"
+    --index-url "https://download.pytorch.org/whl/${FALLBACK_TAG}"
 fi
 
 REQ_NO_TORCH="$(mktemp)"

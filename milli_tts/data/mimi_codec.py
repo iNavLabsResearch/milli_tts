@@ -85,7 +85,8 @@ class MimiCodec(nn.Module):
                         "to the pseudo-random DUMMY codec (it never converges). "
                         "Install the real codec: `pip install moshi "
                         "huggingface_hub` (and verify CUDA works — check "
-                        "`torch.cuda.get_arch_list()`). For CPU smoke tests set "
+                        "`torch.cuda.get_arch_list()`)."
+                        f"{cls._gpu_arch_hint(exc)} For CPU smoke tests set "
                         f"codec.allow_dummy=true. Cause: {exc}") from exc
                 log.warning(
                     "Could not load real Mimi (%s). Falling back to DUMMY codec "
@@ -102,6 +103,33 @@ class MimiCodec(nn.Module):
             return codec.to(dev)
 
         return StaticMemoryCache.get_or_create("codec::mimi", _factory)
+
+    @staticmethod
+    def _gpu_arch_hint(exc: Exception) -> str:
+        """Extra remedy text when the failure is a GPU compute-arch mismatch.
+
+        A "no kernel image is available for execution on the device" error means
+        the installed PyTorch wheel has no kernels for this GPU's compute
+        capability — classically a Blackwell GPU (sm_120: RTX 50-series, RTX PRO
+        6000, B200) on a cu124 wheel that only ships up to sm_90. Point straight
+        at the cu128 fix instead of the generic "check CUDA" advice.
+        """
+        msg = str(exc).lower()
+        if "no kernel image" not in msg and "kernel image is available" not in msg:
+            return ""
+        try:  # best-effort; never let diagnostics raise
+            import torch
+            arches = ", ".join(torch.cuda.get_arch_list()) or "<none>"
+            cc = torch.cuda.get_device_capability(0)
+            gpu = f" (this GPU is sm_{cc[0]}{cc[1]}; wheel built for: {arches})"
+        except Exception:
+            gpu = ""
+        return (
+            f" This looks like a GPU compute-arch mismatch{gpu}: the installed "
+            "PyTorch has no kernels for your GPU. Blackwell GPUs (sm_120) need a "
+            "cu128 wheel — reinstall with: `pip install --index-url "
+            "https://download.pytorch.org/whl/cu128 \"torch>=2.8,<2.10\" "
+            "\"torchaudio>=2.8,<2.10\"` (driver R570+ required).")
 
     @staticmethod
     def _load_moshi_mimi(hf_repo: str, num_codebooks: int,

@@ -1,5 +1,13 @@
 # ---- Core DL ----
-# moshi requires torch<2.10; on Colab use setup_colab.sh (installs matched wheels).
+# moshi requires torch<2.10; on Colab/servers use setup_colab.sh (installs matched
+# wheels from the right CUDA index).
+#
+# Blackwell GPUs (RTX 50-series, RTX PRO 6000, B200 — sm_100/sm_120) need cu128
+# wheels (torch>=2.7). The default PyPI / cu124 wheels only ship kernels up to
+# sm_90 and crash at runtime with "no kernel image is available for execution on
+# the device". On a Blackwell box install with:
+#   pip install --index-url https://download.pytorch.org/whl/cu128 \
+#       "torch>=2.8,<2.10" "torchaudio>=2.8,<2.10"
 torch>=2.2.0,<2.10
 torchaudio>=2.2.0,<2.10
 numpy>=1.24
