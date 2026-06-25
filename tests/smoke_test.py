@@ -26,6 +26,46 @@ def _shrink_config(cfg) -> None:
     object.__setattr__(cfg.training, "gradient_checkpointing", False)
 
 
+def _check_text_pad_invariance(model, codes, audio_mask, speaker_index,
+                               vocab_size: int) -> None:
+    """Right-padded text PAD positions must not leak into audio conditioning.
+
+    Build two batches that are *identical* on the real (unpadded) rows — same
+    real text, same audio, same masks, same Lt (so RoPE positions match) — but
+    whose masked-out trailing text positions hold different token ids (PAD vs
+    random real tokens). With the key-padding mask threaded into the backbone,
+    audio frames attend only to real text, so both must yield the same loss.
+    Before the fix, audio attended to the PAD content and the losses diverged.
+    """
+    model.eval()
+    b, _, _ = codes.shape
+    lt, real_len = 12, 7  # rows are padded from `real_len` up to `lt`
+
+    text_mask = torch.zeros(b, lt, dtype=torch.bool)
+    text_mask[:, :real_len] = True
+    real = torch.randint(0, vocab_size, (b, real_len))
+
+    # Batch A: trailing positions = PAD id. Batch B: trailing = random tokens.
+    text_a = torch.full((b, lt), model.text_pad, dtype=torch.long)
+    text_a[:, :real_len] = real
+    text_b = torch.randint(0, vocab_size, (b, lt))
+    text_b[:, :real_len] = real  # identical real prefix; only PAD region differs
+
+    with torch.no_grad():
+        la = model.compute_loss(text_ids=text_a, text_mask=text_mask,
+                                audio_codes=codes, audio_mask=audio_mask,
+                                speaker_index=speaker_index)["loss"]
+        lb = model.compute_loss(text_ids=text_b, text_mask=text_mask,
+                                audio_codes=codes, audio_mask=audio_mask,
+                                speaker_index=speaker_index)["loss"]
+    delta = (la - lb).abs().item()
+    assert delta < 1e-5, (
+        f"text PAD content leaked into audio conditioning: |Δloss|={delta:.2e} "
+        "(expected ~0 — the key-padding mask is not excluding PAD positions)")
+    model.train()
+    print(f"[ok] text-pad invariance: |Δloss| = {delta:.2e} (PAD ignored)")
+
+
 def main() -> int:
     StaticMemoryCache._reset()
     StaticMemoryCache.load("config.json")
@@ -66,6 +106,9 @@ def main() -> int:
                if p.grad is not None)
     assert torch.isfinite(loss) and grad > 0, "no gradient flowed"
     print(f"[ok] train step: loss = {loss.item():.4f}, acc = {out['acc'].item():.3f}")
+
+    _check_text_pad_invariance(model, codes, audio_mask, speaker_index,
+                               tok.vocab_size)
 
     # generation + decode
     gen = model.generate(text_ids=text_ids[:1], speaker_index=speaker_index[:1],

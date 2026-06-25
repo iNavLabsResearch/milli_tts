@@ -223,7 +223,14 @@ class RQTransformerTTS(BaseTTSModel):
         audio_in = audio_in.masked_fill(pad_in, self.audio_pad)
 
         seq = self._backbone_inputs(text_ids, audio_in, speaker_index)
-        h, _ = self.backbone(seq, causal=True)  # [B, Lt+Ta, D]
+        # Key-padding mask over the full [text | audio] sequence: True = real
+        # token. Right-padded text PAD positions (and padded audio frames) are
+        # excluded from attention so audio frames condition only on real text,
+        # not on the PADs the collator inserts between text and audio.
+        key_padding_mask = torch.cat([text_mask.bool(), audio_mask.bool()],
+                                     dim=1)  # [B, Lt+Ta]
+        h, _ = self.backbone(seq, causal=True,
+                             key_padding_mask=key_padding_mask)  # [B, Lt+Ta, D]
 
         lt = text_ids.shape[1]
         h_audio = h[:, lt:, :]  # [B, Ta, D] hidden used to predict frame t

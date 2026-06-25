@@ -78,7 +78,13 @@ class Attention(nn.Module):
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
                 *, causal: bool = True, cache: Optional[KVCache] = None,
+                key_padding_mask: Optional[torch.Tensor] = None,
                 ) -> Tuple[torch.Tensor, Optional[KVCache]]:
+        """``key_padding_mask``: optional ``[B, S_kv]`` bool, ``True`` = real key,
+        ``False`` = padding (never attended to). It is combined with the causal
+        mask so a query never sees padded *keys*. When ``None`` the original
+        ``is_causal`` fast paths run unchanged (so the KV-cache inference path is
+        untouched)."""
         b, s, _ = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q = q.view(b, s, self.heads, self.head_dim).transpose(1, 2)
@@ -96,31 +102,56 @@ class Attention(nn.Module):
                 cache.v = torch.cat([cache.v, v], dim=2)
             k, v = cache.k, cache.v
             cache.length = k.shape[2]
+            total = cache.length
             # Causality must match training (whole sequence causal). With a KV
             # cache the q-tokens are the newest `s`; they may attend to all
             # cached keys (always in their past) plus be causal *among
             # themselves*. We build an explicit block-causal mask covering both
             # the single-token decode (s==1) and the multi-token prefill cases.
-            if s == 1:
+            if key_padding_mask is None and s == 1:
                 attn = F.scaled_dot_product_attention(
                     q, k, v, dropout_p=0.0, is_causal=False)
             else:
-                total = cache.length
                 # [s, total] bool: True = keep. New token i (abs pos prev_len+i)
                 # may see key j iff j <= prev_len + i.
                 qpos = torch.arange(prev_len, prev_len + s, device=x.device)
                 kpos = torch.arange(total, device=x.device)
-                keep = kpos.unsqueeze(0) <= qpos.unsqueeze(1)  # [s, total]
+                keep = (kpos.unsqueeze(0) <= qpos.unsqueeze(1))  # [s, total]
+                keep = keep.unsqueeze(0).unsqueeze(0)            # [1, 1, s, total]
+                keep = self._apply_key_padding(keep, key_padding_mask, total)
                 attn = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=keep.unsqueeze(0).unsqueeze(0),
-                    dropout_p=0.0)
-        else:
+                    q, k, v, attn_mask=keep, dropout_p=0.0)
+        elif key_padding_mask is None:
             attn = F.scaled_dot_product_attention(
                 q, k, v, dropout_p=self.dropout if self.training else 0.0,
                 is_causal=causal)
+        else:
+            # No cache: fold the (optional) causal mask and the key-padding mask
+            # into one boolean attn_mask. SDPA forbids passing both `attn_mask`
+            # and `is_causal`, so the causal part lives in the mask here.
+            keep = key_padding_mask[:, None, None, :].bool()  # [B, 1, 1, S]
+            keep = keep.expand(b, 1, s, s)
+            if causal:
+                causal_keep = torch.ones(s, s, dtype=torch.bool,
+                                         device=x.device).tril()
+                keep = keep & causal_keep
+            attn = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=keep,
+                dropout_p=self.dropout if self.training else 0.0)
 
         out = attn.transpose(1, 2).contiguous().view(b, s, -1)
         return self.proj(out), cache
+
+    @staticmethod
+    def _apply_key_padding(keep: torch.Tensor,
+                           key_padding_mask: Optional[torch.Tensor],
+                           total: int) -> torch.Tensor:
+        """AND a ``[1, 1, S, total]`` causal-keep mask with an optional
+        ``[B, S_kv]`` key-padding mask (sliced to the cached length)."""
+        if key_padding_mask is None:
+            return keep
+        kpm = key_padding_mask[:, :total].bool()  # [B, total]
+        return keep & kpm[:, None, None, :]
 
 
 class SwiGLU(nn.Module):
@@ -145,8 +176,10 @@ class TransformerBlock(nn.Module):
         self.mlp = SwiGLU(dim, ffn_mult)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-                *, causal: bool = True, cache: Optional[KVCache] = None):
-        h, cache = self.attn(self.norm1(x), cos, sin, causal=causal, cache=cache)
+                *, causal: bool = True, cache: Optional[KVCache] = None,
+                key_padding_mask: Optional[torch.Tensor] = None):
+        h, cache = self.attn(self.norm1(x), cos, sin, causal=causal,
+                             cache=cache, key_padding_mask=key_padding_mask)
         x = x + h
         x = x + self.mlp(self.norm2(x))
         return x, cache
@@ -174,7 +207,8 @@ class TransformerStack(nn.Module):
         return cos[offset:offset + seq_len], sin[offset:offset + seq_len]
 
     def forward(self, x: torch.Tensor, *, causal: bool = True,
-                caches: Optional[list] = None, pos_offset: int = 0):
+                caches: Optional[list] = None, pos_offset: int = 0,
+                key_padding_mask: Optional[torch.Tensor] = None):
         seq_len = x.shape[1]
         cos, sin = self.rope(seq_len, x.device, x.dtype, offset=pos_offset)
         new_caches = []
@@ -182,9 +216,11 @@ class TransformerStack(nn.Module):
             cache = caches[i] if caches is not None else None
             if self.grad_checkpoint and self.training and cache is None:
                 x, cache = torch.utils.checkpoint.checkpoint(
-                    block, x, cos, sin, use_reentrant=False)
+                    block, x, cos, sin, causal=causal,
+                    key_padding_mask=key_padding_mask, use_reentrant=False)
             else:
-                x, cache = block(x, cos, sin, causal=causal, cache=cache)
+                x, cache = block(x, cos, sin, causal=causal, cache=cache,
+                                 key_padding_mask=key_padding_mask)
             new_caches.append(cache)
         x = self.norm(x)
         return x, new_caches
