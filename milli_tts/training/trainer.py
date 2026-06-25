@@ -503,10 +503,15 @@ class Trainer:
                               "voices": len(self.voice_bank),
                               "tokenizer_vocab": self.tokenizer.vocab_size},
                        is_best=is_best)
+        # After a *confirmed* HF push, drop the local step_*.pt snapshots so
+        # checkpoints can't accumulate and refill the disk (the resume point is
+        # safely on the Hub; latest.pt/best.pt stay locally).
         if final:
-            self.hf_sync.push_final(self.ckpt.latest_path)
+            self.hf_sync.push_final(self.ckpt.latest_path,
+                                    on_pushed=self.ckpt.prune_after_push)
         else:
-            self.hf_sync.push_latest(self.ckpt.latest_path)
+            self.hf_sync.push_latest(self.ckpt.latest_path,
+                                     on_pushed=self.ckpt.prune_after_push)
 
     def _maybe_resume(self) -> None:
         # Every rank loads the same checkpoint into its (identical) raw module,

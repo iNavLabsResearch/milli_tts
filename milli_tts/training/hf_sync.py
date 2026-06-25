@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import threading
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 from milli_tts.core.logger import get_logger
 
@@ -60,7 +60,8 @@ class HFCheckpointSync:
             pass
         return datetime.now().strftime(f"run{idx:03d}-%Y%m%d-%H%M%S")
 
-    def _upload(self, local_path: str, name: str, *, blocking: bool) -> None:
+    def _upload(self, local_path: str, name: str, *, blocking: bool,
+                on_pushed: Optional[Callable[[], None]] = None) -> None:
         path_in_repo = f"{self.run_id}/{name}"
 
         def _do() -> None:
@@ -73,6 +74,14 @@ class HFCheckpointSync:
                          path_in_repo)
             except Exception as exc:  # pragma: no cover
                 log.warning("HF checkpoint push failed (%s): %s", name, exc)
+                return  # push failed -> do NOT prune local fallbacks
+            if on_pushed is not None:
+                # Only reached on a confirmed upload: now it's safe to reclaim
+                # local disk. Guarded so cleanup errors never crash the thread.
+                try:
+                    on_pushed()
+                except Exception as exc:  # pragma: no cover
+                    log.warning("post-push cleanup failed: %s", exc)
 
         if blocking:
             _do()
@@ -84,15 +93,24 @@ class HFCheckpointSync:
             self._thread.start()
 
     # ------------------------------------------------------------------ #
-    def push_latest(self, local_path: str) -> None:
-        """Rolling resume point, uploaded in the background (non-blocking)."""
-        if self.enabled:
-            self._upload(local_path, "latest.pt", blocking=False)
+    def push_latest(self, local_path: str,
+                    on_pushed: Optional[Callable[[], None]] = None) -> None:
+        """Rolling resume point, uploaded in the background (non-blocking).
 
-    def push_final(self, local_path: str) -> None:
+        ``on_pushed`` runs on the upload thread *only after* the upload
+        succeeds — used to delete now-redundant local checkpoints so disk can't
+        fill. If the push is skipped (a previous one is still running) or fails,
+        the callback is not invoked, so local fallbacks are kept.
+        """
+        if self.enabled:
+            self._upload(local_path, "latest.pt", blocking=False,
+                         on_pushed=on_pushed)
+
+    def push_final(self, local_path: str,
+                   on_pushed: Optional[Callable[[], None]] = None) -> None:
         """End-of-run checkpoint — wait for any in-flight push, then upload."""
         if not self.enabled:
             return
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=900)
-        self._upload(local_path, "final.pt", blocking=True)
+        self._upload(local_path, "final.pt", blocking=True, on_pushed=on_pushed)
