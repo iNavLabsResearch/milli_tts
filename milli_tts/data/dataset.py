@@ -29,6 +29,7 @@ map-style mode.
 
 from __future__ import annotations
 
+import os
 from typing import Dict, Iterator, Optional
 
 import torch
@@ -81,7 +82,8 @@ class IndicVoicesDataset(IterableDataset):
     def __init__(self, *, split: Optional[str] = None,
                  tokenizer: Optional[TextTokenizer] = None,
                  voice_bank: Optional[VoiceBank] = None,
-                 register_voices: bool = True) -> None:
+                 register_voices: bool = True,
+                 role: str = "train", val_size: int = 0) -> None:
         super().__init__()
         cfg = StaticMemoryCache.config()
         self.cfg = cfg
@@ -91,6 +93,10 @@ class IndicVoicesDataset(IterableDataset):
         self.min_sec = cfg.training.min_audio_seconds
         self.max_sec = cfg.training.max_audio_seconds
         self.register_voices = register_voices
+        # role="val" yields the first `val_size` stream rows as a held-out set;
+        # role="train" skips those same rows so the two never overlap.
+        self.role = role
+        self.val_size = int(val_size)
         self.tokenizer = tokenizer or TextTokenizer.from_config()
         self.voice_bank = voice_bank or VoiceBank.from_config()
         self._hf_dataset = None
@@ -169,8 +175,20 @@ class IndicVoicesDataset(IterableDataset):
         feats = getattr(ds, "features", None)
         gfeat = feats.get("gender") if feats else None
         self._gender_names = list(getattr(gfeat, "names", None) or []) or None
-        log.info("Stream ready (audio col=%s, gender_names=%s, self-decode). "
-                 "Pulling rows…", audio_col, self._gender_names)
+
+        # Held-out validation split: a deterministic prefix of the stream. The
+        # validation set takes the first `val_size` rows; training skips them so
+        # the two are disjoint (no leakage). Requires no extra `validation`
+        # split, which this corpus doesn't ship.
+        if self.val_size > 0:
+            if self.role == "val":
+                ds = ds.take(self.val_size)
+            elif self.role == "train":
+                ds = ds.skip(self.val_size)
+
+        log.info("Stream ready (role=%s, audio col=%s, gender_names=%s, "
+                 "self-decode). Pulling rows…", self.role, audio_col,
+                 self._gender_names)
         return ds
 
     @staticmethod
@@ -299,8 +317,11 @@ class IndicVoicesDataset(IterableDataset):
             spk_index = self.voice_bank.add_or_get(speaker_id, gender=gender,
                                                    lang=lang_code)
         else:
+            # Deterministic fallback (same hashing as add_or_get) so an
+            # not-yet-registered voice still maps to its real embedding row.
             spk_index = (self.voice_bank.index_of(speaker_id)
-                         if speaker_id in self.voice_bank else 0)
+                         if speaker_id in self.voice_bank
+                         else self.voice_bank.stable_index(speaker_id))
 
         text_ids = self.tokenizer.encode_tensor(text)
         return {
@@ -317,17 +338,26 @@ class IndicVoicesDataset(IterableDataset):
     def __iter__(self) -> Iterator[Dict]:
         if self._hf_dataset is None:
             self._hf_dataset = self._build_hf_dataset()
-        # Shard across DataLoader workers when streaming so each worker sees a
-        # DISJOINT slice (otherwise N workers would each replay the same rows).
-        worker = torch.utils.data.get_worker_info()
         ds = self._hf_dataset
-        stride, offset = 1, 0
-        if worker is not None and self.hf.streaming and worker.num_workers > 1:
-            if hasattr(ds, "shard"):
-                ds = ds.shard(num_shards=worker.num_workers, index=worker.id)
-            else:  # fallback: stride the iterator by worker id (no duplication)
-                stride, offset = worker.num_workers, worker.id
+        # Shard the stream so each (DDP rank × DataLoader worker) sees a DISJOINT
+        # slice — otherwise every GPU/worker would replay the same rows. Total
+        # shards = world_size × num_workers; this worker's global shard index is
+        # rank·num_workers + worker_id. Rank/size come from env (set by DDP) so
+        # they're correct inside forked workers too. Validation (role="val") is
+        # run on a single process over the full take()-set, so it isn't sharded.
+        worker = torch.utils.data.get_worker_info()
+        nw = worker.num_workers if worker is not None else 1
         wid = worker.id if worker is not None else 0
+        rank = int(os.environ.get("RANK", "0"))
+        world = int(os.environ.get("WORLD_SIZE", "1"))
+        stride, offset = 1, 0
+        total_shards = world * nw if self.role == "train" else 1
+        shard_index = rank * nw + wid
+        if self.hf.streaming and total_shards > 1:
+            if hasattr(ds, "shard"):
+                ds = ds.shard(num_shards=total_shards, index=shard_index)
+            else:  # fallback: stride the iterator (no duplication across shards)
+                stride, offset = total_shards, shard_index
         seen = 0
         yielded = 0
         skip_reasons: Dict[str, int] = {}

@@ -78,6 +78,24 @@ class VoiceBank:
         return speaker_id in self._entries
 
     # ------------------------------------------------------------------ #
+    def stable_index(self, speaker_id: str) -> int:
+        """Deterministic ``speaker_id -> index`` via a content hash.
+
+        Crucially this is **independent of insertion order**, so every
+        DistributedDataParallel rank maps a given speaker to the *same*
+        embedding row even though each rank streams a different shard and meets
+        speakers in a different order. (A sequential ``len(entries)`` index would
+        desync the speaker embedding across ranks and corrupt its gradients.)
+
+        Collisions are possible in principle but vanishingly unlikely while the
+        speaker count stays well under ``max_speakers`` (e.g. 2 here); two
+        colliding ids would simply share one voice embedding.
+        """
+        import hashlib
+
+        h = hashlib.blake2b(speaker_id.encode("utf-8"), digest_size=8).digest()
+        return int.from_bytes(h, "big") % self.max_speakers
+
     def add_or_get(self, speaker_id: str, *, gender: Optional[str] = None,
                    lang: Optional[str] = None) -> int:
         """Return the stable integer index for ``speaker_id`` (assigning if new)."""
@@ -85,11 +103,13 @@ class VoiceBank:
             entry = self._entries.get(speaker_id)
             if entry is None:
                 if len(self._entries) >= self.max_speakers:
-                    raise ValueError(
-                        f"VoiceBank full ({self.max_speakers}); raise "
-                        f"voice.max_speakers in config.json")
+                    log.warning(
+                        "VoiceBank has %d speakers (>= max_speakers=%d); new "
+                        "voices will collide on shared embeddings. Raise "
+                        "voice.max_speakers in config.json.",
+                        len(self._entries), self.max_speakers)
                 entry = VoiceEntry(speaker_id=speaker_id,
-                                   index=len(self._entries),
+                                   index=self.stable_index(speaker_id),
                                    gender=gender, lang=lang)
                 self._entries[speaker_id] = entry
             entry.num_utterances += 1

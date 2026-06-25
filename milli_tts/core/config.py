@@ -185,6 +185,9 @@ class TrainingConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
+    # Cross-entropy label smoothing (0 disables). Regularizes the per-codebook
+    # softmax to reduce over-confidence and smooth training.
+    label_smoothing: float = 0.0
     lr_schedule: str = "cosine"
     gradient_checkpointing: bool = True
     num_workers: int = 2
@@ -196,6 +199,8 @@ class TrainingConfig:
     max_audio_seconds: float = 20.0
     min_audio_seconds: float = 1.0
     compile_model: bool = False
+    # Size of the held-out validation set (stream prefix) for periodic val loss.
+    eval_samples: int = 256
 
 
 @dataclass(frozen=True)

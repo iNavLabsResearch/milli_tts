@@ -57,6 +57,7 @@ class WandbTracker:
         try:
             wandb.define_metric("train/step")
             wandb.define_metric("train/*", step_metric="train/step")
+            wandb.define_metric("val/*", step_metric="train/step")
         except Exception:
             pass
         log.info("W&B run started: %s", getattr(self._run, "url", "(offline)"))

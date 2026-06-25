@@ -208,10 +208,26 @@ class RQTransformerTTS(BaseTTSModel):
     # ------------------------------------------------------------------ #
     # Training
     # ------------------------------------------------------------------ #
+    def forward(self, **kwargs) -> Dict[str, torch.Tensor]:
+        """DDP entry point: routes to :meth:`compute_loss`.
+
+        DistributedDataParallel only installs its gradient-sync hooks around
+        ``forward``, so the trainer calls ``ddp_model(**batch)`` (not
+        ``compute_loss`` directly) to get cross-GPU gradient averaging.
+        """
+        return self.compute_loss(**kwargs)
+
     def compute_loss(self, *, text_ids: torch.Tensor, text_mask: torch.Tensor,
                      audio_codes: torch.Tensor, audio_mask: torch.Tensor,
-                     speaker_index: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """audio_codes: [B, Q, Ta] (Mimi codes). audio_mask: [B, Ta] bool."""
+                     speaker_index: torch.Tensor,
+                     label_smoothing: float = 0.0) -> Dict[str, torch.Tensor]:
+        """audio_codes: [B, Q, Ta] (Mimi codes). audio_mask: [B, Ta] bool.
+
+        ``label_smoothing`` (0 disables) regularizes the per-codebook softmax,
+        which stabilizes the gradients and curbs over-confident logits on the
+        2048-way prediction. Validation passes 0 so ``val/ppl`` stays a true
+        perplexity.
+        """
         b, q, ta = audio_codes.shape
         device = audio_codes.device
 
@@ -245,16 +261,21 @@ class RQTransformerTTS(BaseTTSModel):
         logits = logits[mask_flat]              # [M, Q, cb]
         targets = tgt_flat[mask_flat]           # [M, Q]
         loss = F.cross_entropy(
-            logits.reshape(-1, self.codebook_size), targets.reshape(-1))
+            logits.reshape(-1, self.codebook_size), targets.reshape(-1),
+            label_smoothing=label_smoothing)
 
         with torch.no_grad():
             pred = logits.argmax(-1)
             acc = (pred == targets).float().mean()
             # per-codebook accuracy for the first codebook (semantic-ish)
             acc0 = (pred[:, 0] == targets[:, 0]).float().mean()
+            # report a TRUE perplexity even when training with label smoothing
+            # (which otherwise inflates the CE) by recomputing unsmoothed CE.
+            ppl = F.cross_entropy(
+                logits.reshape(-1, self.codebook_size),
+                targets.reshape(-1)).exp()
 
-        return {"loss": loss, "acc": acc, "acc_cb0": acc0,
-                "ppl": loss.exp().detach()}
+        return {"loss": loss, "acc": acc, "acc_cb0": acc0, "ppl": ppl}
 
     # ------------------------------------------------------------------ #
     # Inference
