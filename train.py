@@ -14,11 +14,19 @@ Everything else (dataset, model, optimizer, W&B, checkpoints) is driven by
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
 
-from milli_tts.bootstrap import bootstrap
-from milli_tts.core.logger import get_logger
-from milli_tts.core.static_memory_cache import StaticMemoryCache
-from milli_tts.training import Trainer
+# Make `milli_tts` importable when run directly (e.g. `python train.py`) without
+# `pip install -e .` — add the repo root to sys.path BEFORE importing the package.
+_REPO_ROOT = Path(__file__).resolve().parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from milli_tts.bootstrap import bootstrap  # noqa: E402
+from milli_tts.core.logger import get_logger  # noqa: E402
+from milli_tts.core.static_memory_cache import StaticMemoryCache  # noqa: E402
+from milli_tts.training import Trainer  # noqa: E402
 
 log = get_logger("train")
 

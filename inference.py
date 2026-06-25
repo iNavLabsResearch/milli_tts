@@ -19,10 +19,18 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
 
-from milli_tts.bootstrap import bootstrap
-from milli_tts.core.logger import get_logger
-from milli_tts.inference import TTSInferenceEngine
+# Make `milli_tts` importable when run directly (e.g. `python inference.py`)
+# without `pip install -e .` — add the repo root to sys.path BEFORE importing.
+_REPO_ROOT = Path(__file__).resolve().parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from milli_tts.bootstrap import bootstrap  # noqa: E402
+from milli_tts.core.logger import get_logger  # noqa: E402
+from milli_tts.inference import TTSInferenceEngine  # noqa: E402
 
 log = get_logger("inference")
 

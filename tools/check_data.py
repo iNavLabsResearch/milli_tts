@@ -15,11 +15,20 @@ the real row keys, which tells you exactly what to fix in config/dataset.
 from __future__ import annotations
 
 import argparse
+import sys
 import time
+from pathlib import Path
 
-from milli_tts.bootstrap import bootstrap
-from milli_tts.core.logger import get_logger
-from milli_tts.data.dataset import IndicVoicesDataset
+# Make `milli_tts` importable when run directly (e.g. `python tools/check_data.py`)
+# without `pip install -e .` — add the repo root (parent of tools/) to sys.path
+# BEFORE importing the package.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from milli_tts.bootstrap import bootstrap  # noqa: E402
+from milli_tts.core.logger import get_logger  # noqa: E402
+from milli_tts.data.dataset import IndicVoicesDataset  # noqa: E402
 
 log = get_logger("check_data")
 
