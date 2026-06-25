@@ -144,6 +144,20 @@ class Trainer:
             return torch.float16, True
         return torch.float32, False
 
+    @staticmethod
+    def _worker_mp_context():
+        """Start method for DataLoader workers.
+
+        Under DDP the trainer processes are *spawned*, so the DataLoader would
+        otherwise spawn its workers too — which pickles the whole dataset and
+        fails on the (unpicklable) streaming state / locks it references. Forcing
+        ``fork`` (available on Linux/Kaggle) lets workers inherit the dataset
+        instead of pickling it, which is also the default in non-DDP runs.
+        """
+        import multiprocessing as _mp
+
+        return "fork" if "fork" in _mp.get_all_start_methods() else None
+
     def _build_loader(self) -> DataLoader:
         # role="train" skips the first `eval_samples` stream rows (the held-out
         # validation prefix) and shards the rest across DDP ranks × workers.
@@ -152,10 +166,12 @@ class Trainer:
                                      register_voices=True, role="train",
                                      val_size=self.tcfg.eval_samples)
         collator = DelayedStreamCollator(text_pad_id=self.tokenizer.pad_id)
+        nw = self.tcfg.num_workers
         return DataLoader(
             dataset, batch_size=self.tcfg.batch_size, collate_fn=collator,
-            num_workers=self.tcfg.num_workers, pin_memory=(self.device.type == "cuda"),
-            drop_last=True, persistent_workers=self.tcfg.num_workers > 0)
+            num_workers=nw, pin_memory=(self.device.type == "cuda"),
+            drop_last=True, persistent_workers=nw > 0,
+            multiprocessing_context=self._worker_mp_context() if nw > 0 else None)
 
     # ------------------------------------------------------------------ #
     # Validation

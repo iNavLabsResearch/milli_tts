@@ -55,6 +55,18 @@ class VoiceBank:
         self._lock = threading.RLock()
         os.makedirs(store_dir, exist_ok=True)
 
+    # A threading.RLock can't be pickled, which breaks sending a dataset that
+    # references this bank to *spawned* DataLoader workers. Drop the lock on
+    # pickle and recreate it on the other side.
+    def __getstate__(self) -> Dict:
+        state = self.__dict__.copy()
+        state.pop("_lock", None)
+        return state
+
+    def __setstate__(self, state: Dict) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.RLock()
+
     # ------------------------------------------------------------------ #
     @classmethod
     def from_config(cls) -> "VoiceBank":
