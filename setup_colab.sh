@@ -124,6 +124,10 @@ for ac in ("audio", "audio_filepath", "wav"):
         break
 row = next(iter(ds))
 print("    OK — stream is live. First-row columns:", list(row.keys())[:14])
+# Hard-exit: the HF streaming background thread (aiohttp/fsspec) crashes the
+# interpreter with "PyGILState_Release ... finalizing" if GC'd at shutdown. The
+# work is done, so skip the buggy finalizers (same pattern as train.py).
+import os, sys; sys.stdout.flush(); os._exit(0)
 PY
 
 if [ "${PREFETCH_HINDI:-0}" = "1" ]; then
@@ -139,6 +143,7 @@ from huggingface_hub import snapshot_download
 path = snapshot_download(repo_id=cfg.huggingface.dataset_repo, repo_type="dataset",
                          token=os.environ.get("HF_TOKEN"))
 print("    Data cached at:", path)
+import sys; sys.stdout.flush(); os._exit(0)   # skip finalizer crash (see above)
 PY
 else
   echo "    (streaming during training; set PREFETCH_HINDI=1 to pre-download)"
