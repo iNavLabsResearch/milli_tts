@@ -74,6 +74,15 @@ print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
 python -c "import torchaudio; print('torchaudio', torchaudio.__version__, 'OK')" \
   || echo '    WARN: torchaudio failed to load; continuing (librosa/soundfile fallback active).'
 
+# `datasets` will try to decode the `audio` column with torchcodec, whose prebuilt
+# libs are ABI-pinned to a specific torch+FFmpeg combo that Kaggle/Colab rarely
+# matches — importing it HARD-CRASHES the interpreter (libavutil.so.* missing /
+# torch CUDA symbol mismatch). This project never needs it: audio is decoded with
+# soundfile/librosa and the dataset casts Audio(decode=False). Remove it so
+# `datasets` can't touch it. (No-op if absent.)
+echo "==> Removing torchcodec (incompatible on T4; we decode via soundfile)…"
+pip -q uninstall -y torchcodec >/dev/null 2>&1 || true
+
 # ── Dataset access check (repo + token come from config.json) ────────────────
 # Hindi-ONLY. Everything — the dataset repo, its config, and the HF token — is
 # read from config.json via bootstrap() (which exports HF_TOKEN from the
@@ -102,6 +111,17 @@ except Exception as e:
     print("    (config", repr(dscfg), "unavailable:", str(e)[:120],
           "— retrying with no config)")
     ds = _open(None)
+# Read the audio column as raw bytes (decode=False) — exactly like the training
+# dataset — so iterating never invokes torchcodec.
+from datasets import Audio
+feats = getattr(ds, "features", None) or {}
+for ac in ("audio", "audio_filepath", "wav"):
+    if ac in feats:
+        try:
+            ds = ds.cast_column(ac, Audio(decode=False))
+        except Exception:
+            pass
+        break
 row = next(iter(ds))
 print("    OK — stream is live. First-row columns:", list(row.keys())[:14])
 PY
