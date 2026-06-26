@@ -101,6 +101,11 @@ class RQTransformerTTS(BaseTTSModel):
             [nn.Linear(self.depth_dim, codebook_size, bias=False)
              for _ in range(num_codebooks)])
 
+        # Per-codebook CE weights (None = uniform). Renormalized to mean 1 so the
+        # loss scale stays comparable to a uniform run — see ModelConfig docs.
+        self.cb_loss_w = self._build_codebook_weights(
+            getattr(model_cfg, "codebook_loss_weights", None), num_codebooks)
+
         self.apply(self._init_weights)
         # Scale every residual output projection by 1/sqrt(2*n_layers) (GPT-2 /
         # nanoGPT). Without it the residual stream's variance grows with depth,
@@ -108,6 +113,26 @@ class RQTransformerTTS(BaseTTSModel):
         # showed — the fix keeps activations well-conditioned from step 0.
         self._scale_residual_init(self.backbone, model_cfg.backbone_layers)
         self._scale_residual_init(self.depth, model_cfg.depth_layers)
+
+    # ------------------------------------------------------------------ #
+    def _build_codebook_weights(self, weights, num_codebooks: int):
+        """Normalize per-codebook loss weights to mean 1, registered as a buffer.
+
+        Returns ``None`` (uniform) when ``weights`` is unset. A list of the wrong
+        length is a config error and raises, rather than silently mis-weighting.
+        """
+        if not weights:
+            return None
+        if len(weights) != num_codebooks:
+            raise ValueError(
+                f"codebook_loss_weights has {len(weights)} entries but the codec "
+                f"has {num_codebooks} codebooks — they must match.")
+        w = torch.tensor(weights, dtype=torch.float32)
+        if (w <= 0).any():
+            raise ValueError("codebook_loss_weights must all be > 0.")
+        w = w * (num_codebooks / w.sum())          # mean -> 1
+        self.register_buffer("_cb_loss_w", w, persistent=False)
+        return self._cb_loss_w
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -275,9 +300,18 @@ class RQTransformerTTS(BaseTTSModel):
         mask_flat = audio_mask.reshape(b * ta)  # [B*Ta]
         logits = logits[mask_flat]              # [M, Q, cb]
         targets = tgt_flat[mask_flat]           # [M, Q]
-        loss = F.cross_entropy(
-            logits.reshape(-1, self.codebook_size), targets.reshape(-1),
-            label_smoothing=label_smoothing)
+        if self.cb_loss_w is None:
+            loss = F.cross_entropy(
+                logits.reshape(-1, self.codebook_size), targets.reshape(-1),
+                label_smoothing=label_smoothing)
+        else:
+            # Per-token CE, reshaped to [M, Q], then weighted per codebook. The
+            # weights have mean 1, so this keeps the loss/grad scale comparable to
+            # the uniform case while steering capacity toward cb0 (semantic).
+            ce = F.cross_entropy(
+                logits.reshape(-1, self.codebook_size), targets.reshape(-1),
+                label_smoothing=label_smoothing, reduction="none").reshape(-1, q)
+            loss = (ce * self.cb_loss_w.to(ce.dtype)).mean()
 
         with torch.no_grad():
             pred = logits.argmax(-1)

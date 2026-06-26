@@ -131,6 +131,13 @@ class HuggingFaceConfig:
     # Lowest acceptable `verification_report.decision`. Order (best→worst):
     # excellent > good > average > poor. "good" keeps excellent+good.
     min_quality_decision: str = "good"
+    # IndicVoices-R signal-quality gates (the `verification_report` column does
+    # NOT exist in IndicVoices-R — it ships per-clip SNR / C50 / ASR-CER columns
+    # instead). These are the "get clean audio" lever for the R corpus. None =
+    # off (IndicVoices-R is already restored/clean, so they default off; set them
+    # to drop the worst clips, e.g. min_snr=15.0 dB, max_cer=0.5).
+    min_snr: Optional[float] = None
+    max_cer: Optional[float] = None
     # Deterministic utterance-level train/val split: a row is held out for
     # validation iff hash(speaker_id|text) % val_holdout_mod == 0 (so ≈1/mod is
     # val). Keyed on the utterance (not the speaker) so val speakers still appear
@@ -187,6 +194,17 @@ class ModelConfig:
     text_delay: int = 0
     audio_delay_steps: int = 2
     stream_delay_frames: int = 16
+    # Per-codebook cross-entropy weights (length == codec.num_codebooks). This is
+    # the "weight the depth transformer toward better learning" lever: the depth
+    # transformer predicts ALL Q codebooks, and up-weighting the hard/important
+    # ones focuses its capacity there WITHOUT adding parameters (so training stays
+    # the same speed). cb0 is Mimi's WavLM-distilled *semantic* token and the main
+    # intelligibility driver, so it gets the largest weight; the fine-texture
+    # codebooks (cb6/cb7) — which the model learns easily and which matter least
+    # for intelligibility — get the smallest. Weights are renormalized to mean 1
+    # internally so train/val loss and perplexity stay comparable to a uniform run.
+    # None / empty list = uniform (original behaviour).
+    codebook_loss_weights: Optional[List[float]] = None
 
 
 @dataclass(frozen=True)

@@ -141,10 +141,22 @@ class IndicVoicesDataset(IterableDataset):
         self._speaker_names = None  # filled if speaker_id is a ClassLabel
 
         # ---- quality + speaker policy -------------------------------- #
-        self.is_indicvoices = "indicvoices" in str(self.hf.dataset_repo).lower()
+        _repo_l = str(self.hf.dataset_repo).lower()
+        self.is_indicvoices = "indicvoices" in _repo_l
+        # IndicVoices-R (e.g. SPRINGLab/IndicVoices-R_Hindi) is a per-language TTS
+        # corpus shipped as a SINGLE config — unlike ai4bharat/IndicVoices which
+        # has one HF config per language. We detect it so (a) we never try to
+        # auto-select a nonexistent "hindi" language-config, and (b) quality
+        # filtering uses its SNR/CER columns instead of the absent
+        # `verification_report`.
+        self.is_indicvoices_r = ("indicvoices-r" in _repo_l
+                                 or "indicvoices_r" in _repo_l)
         self.quality_filter = bool(getattr(self.hf, "quality_filter", False))
         self.min_decision_rank = _DECISION_RANK.get(
             str(getattr(self.hf, "min_quality_decision", "good")).lower(), 2)
+        # IndicVoices-R signal-quality thresholds (None = off).
+        self.min_snr = getattr(self.hf, "min_snr", None)
+        self.max_cer = getattr(self.hf, "max_cer", None)
         # "row" -> one learned embedding per raw speaker_id (real per-speaker
         # voices, what inference selects); "gender" -> collapse to hi_female/
         # hi_male.
@@ -162,12 +174,14 @@ class IndicVoicesDataset(IterableDataset):
         self.allowed_langs = _normalize_langs(getattr(self.hf, "languages", None))
         self.dataset_config = self.hf.dataset_config
 
-        # IndicVoices ships one HF *config per language*, so a single requested
-        # language also auto-selects the matching `dataset_config`. This remap is
-        # IndicVoices-specific — other corpora (e.g. SPRINGLab/IndicTTS-Hindi,
-        # config "default") must keep their own config name, so gate it on repo.
-        is_indicvoices = self.is_indicvoices
-        if is_indicvoices and len(self.allowed_langs) == 1:
+        # ai4bharat/IndicVoices ships one HF *config per language*, so a single
+        # requested language also auto-selects the matching `dataset_config`. This
+        # remap is specific to that multi-config layout — single-config corpora
+        # (SPRINGLab/IndicVoices-R_Hindi, SPRINGLab/IndicTTS-Hindi, …) must keep
+        # their own config (often null), so gate it OUT for IndicVoices-R.
+        per_language_config_repo = (self.is_indicvoices
+                                    and not self.is_indicvoices_r)
+        if per_language_config_repo and len(self.allowed_langs) == 1:
             only = next(iter(self.allowed_langs))
             mapped = _LANG_CODE_TO_CONFIG.get(only)
             if mapped and mapped != self.dataset_config:
@@ -302,6 +316,18 @@ class IndicVoicesDataset(IterableDataset):
                 return v
         return None
 
+    @staticmethod
+    def _as_float(value) -> Optional[float]:
+        """Coerce a numeric cell (python number, str, or 0-d tensor) to float."""
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            if hasattr(value, "item"):   # 0-d torch tensor / numpy scalar
+                return float(value.item())
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
     def _gender_name(self, gender) -> Optional[str]:
         """Normalize a row's gender to a lowercase name ("female"/"male").
 
@@ -385,6 +411,16 @@ class IndicVoicesDataset(IterableDataset):
         """
         if not (self.quality_filter and self.is_indicvoices):
             return True
+        # IndicVoices-R path: no `verification_report`, but per-clip SNR / CER.
+        # Applied whenever thresholds are set (the "get clean audio" gate).
+        if self.min_snr is not None:
+            snr = self._as_float(row.get("snr"))
+            if snr is not None and snr < float(self.min_snr):
+                return False
+        if self.max_cer is not None:
+            cer = self._as_float(row.get("cer"))
+            if cer is not None and cer > float(self.max_cer):
+                return False
         report = row.get("verification_report")
         if report is None:
             return True

@@ -20,8 +20,8 @@
 
   "huggingface": {
     "token": "REV:SueqOSPqunzpeCdQGcpfIlyvKMGHcHIYBh_fh",
-    "dataset_repo": "ai4bharat/IndicVoices",
-    "dataset_config": "hindi",
+    "dataset_repo": "SPRINGLab/IndicVoices-R_Hindi",
+    "dataset_config": null,
     "dataset_split": "train",
     "streaming": true,
     "push_to_hub": false,
@@ -72,7 +72,8 @@
     "max_seq_frames": 1500,
     "text_delay": 0,
     "audio_delay_steps": 2,
-    "stream_delay_frames": 16
+    "stream_delay_frames": 16,
+    "codebook_loss_weights": [2.0, 1.4, 1.1, 1.0, 0.9, 0.8, 0.7, 0.6]
   },
 
   "voice": {
