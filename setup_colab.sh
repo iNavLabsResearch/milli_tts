@@ -74,42 +74,54 @@ print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
 python -c "import torchaudio; print('torchaudio', torchaudio.__version__, 'OK')" \
   || echo '    WARN: torchaudio failed to load; continuing (librosa/soundfile fallback active).'
 
-# ── Hindi-ONLY dataset (ai4bharat/IndicVoices) ───────────────────────────────
-# This project trains on Hindi ONLY. With dataset_config="hindi" + streaming the
-# pipeline never fetches or stores any other language. This step (a) confirms
-# the gated dataset is reachable with your token, and (b) — when PREFETCH_HINDI=1
-# — downloads ONLY the Hindi shards to the HF cache (no other language on disk).
-echo "==> Verifying Hindi-only IndicVoices access (ai4bharat/IndicVoices)…"
-python - <<'PY' || echo "    WARN: Hindi access check failed — set HF_TOKEN and accept the terms at https://huggingface.co/datasets/ai4bharat/IndicVoices"
+# ── Dataset access check (repo + token come from config.json) ────────────────
+# Hindi-ONLY. Everything — the dataset repo, its config, and the HF token — is
+# read from config.json via bootstrap() (which exports HF_TOKEN from the
+# REV-encoded token in the file). So this verifies EXACTLY what training will
+# stream (currently SPRINGLab/IndicVoices-R_Hindi) with no hardcoded repo and no
+# separate HF_TOKEN export needed. PREFETCH_HINDI=1 pre-downloads the repo.
+echo "==> Verifying dataset access (repo + token from config.json)…"
+python - <<'PY' || echo "    WARN: dataset access check failed — confirm huggingface.token in config.json is valid and, if the repo is gated, that you've accepted its terms on the Hub."
 import os
-tok = os.environ.get("HF_TOKEN")
+from milli_tts.bootstrap import bootstrap
+from milli_tts.core.static_memory_cache import StaticMemoryCache
+bootstrap()                                    # loads config.json, exports HF_TOKEN
+cfg = StaticMemoryCache.config()
+repo, dscfg = cfg.huggingface.dataset_repo, cfg.huggingface.dataset_config
+split, tok = cfg.huggingface.dataset_split, os.environ.get("HF_TOKEN")
 from datasets import load_dataset
-def _open(cfg):
-    return load_dataset("ai4bharat/IndicVoices", cfg, split="train",
-                        streaming=True, token=tok)
+def _open(c):
+    if c:
+        return load_dataset(repo, c, split=split, streaming=True, token=tok)
+    return load_dataset(repo, split=split, streaming=True, token=tok)
+print("    Dataset:", repo, "| config:", repr(dscfg), "| token:",
+      "present" if tok else "MISSING")
 try:
-    ds = _open("hindi")            # per-language config layout
+    ds = _open(dscfg)
 except Exception as e:
-    print("    (config 'hindi' unavailable:", str(e)[:120], "— using lang filter)")
-    ds = _open(None)              # single-config layout w/ a per-row `lang`
+    print("    (config", repr(dscfg), "unavailable:", str(e)[:120],
+          "— retrying with no config)")
+    ds = _open(None)
 row = next(iter(ds))
-print("    OK — Hindi stream is live. First-row columns:", list(row.keys())[:12])
+print("    OK — stream is live. First-row columns:", list(row.keys())[:14])
 PY
 
 if [ "${PREFETCH_HINDI:-0}" = "1" ]; then
-  echo "==> PREFETCH_HINDI=1 -> downloading ONLY the Hindi shards (no other language)…"
-  python - <<'PY' || echo "    WARN: Hindi prefetch failed (training still works via streaming)."
+  echo "==> PREFETCH_HINDI=1 -> downloading the dataset snapshot to the HF cache…"
+  python - <<'PY' || echo "    WARN: prefetch failed (training still works via streaming)."
 import os
+from milli_tts.bootstrap import bootstrap
+from milli_tts.core.static_memory_cache import StaticMemoryCache
+bootstrap()
+cfg = StaticMemoryCache.config()
 from huggingface_hub import snapshot_download
-tok = os.environ.get("HF_TOKEN")
-# Mirrors the HF tree https://huggingface.co/datasets/ai4bharat/IndicVoices/tree/main/hindi
-path = snapshot_download(
-    repo_id="ai4bharat/IndicVoices", repo_type="dataset", token=tok,
-    allow_patterns=["*[Hh]indi*", "**/[Hh]indi/**", "data/[Hh]indi/*", "hindi/*"])
-print("    Hindi data cached at:", path)
+# IndicVoices-R_Hindi is already a single Hindi repo, so grab it whole.
+path = snapshot_download(repo_id=cfg.huggingface.dataset_repo, repo_type="dataset",
+                         token=os.environ.get("HF_TOKEN"))
+print("    Data cached at:", path)
 PY
 else
-  echo "    (streaming Hindi during training; set PREFETCH_HINDI=1 to pre-download)"
+  echo "    (streaming during training; set PREFETCH_HINDI=1 to pre-download)"
 fi
 
 # Build the "perfect dataset": the per-speaker catalog (collision-free voice

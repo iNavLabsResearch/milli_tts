@@ -1,4 +1,7 @@
-# Proven Training Guide: Hindi TTS with Mimi
+# Training Guide: Hindi TTS with Mimi (IndicVoices-R)
+
+This guide is kept in sync with the code. Where an earlier draft made claims that
+the codebase already handled (or handled differently), those are corrected below.
 
 ## What the Architecture Does (Quick Summary)
 
@@ -18,296 +21,249 @@ prev audio frame  ─────────────┘              │
 ```
 
 - **Backbone** = causal Transformer over the joint [text | audio] sequence.
-  Text acts as a prefix; every audio frame attends to all text, no cross-attention needed.
+  Text acts as a prefix; every audio frame attends to all text, no cross-attention.
 - **DepthHead** = tiny causal Transformer over the 8 RVQ codebooks of one frame.
   This removes the need for MusicGen-style codebook delay patterns.
-- **Mimi** is always **frozen**. The model only predicts codes; Mimi decodes them.
+- **Mimi** is always **frozen**. The model only predicts integer codes; Mimi decodes them.
+
+Two model implementations are registered and interchangeable (`model.arch`):
+`rq_transformer_tts` (v1) and `rq_transformer_tts_v2` (modular rewrite — same
+`compute_loss`/`generate`/checkpoint format). Training uses v1 by default.
 
 ---
 
-## Bug 1: macOS DataLoader Crash (Training Never Ran)
+## Dataset: SPRINGLab/IndicVoices-R_Hindi
 
-Your W&B run shows `train/step=0` and then this traceback:
+This project trains on **`SPRINGLab/IndicVoices-R_Hindi`** — the cleaned / restored
+("‑R") TTS variant of IndicVoices, Hindi only. It is a **single-config** repo, so:
 
-```
-TypeError: cannot pickle '_thread.RLock' object
-  File ".../popen_spawn_posix.py"
-```
+- `huggingface.dataset_config` must be **`null`** (not `"hindi"`). The per-language
+  config remap only applies to the multi-config `ai4bharat/IndicVoices`.
+- **Text input = the `normalized` column** (cleaned transcript, no `[uhh]`/`<noise>`
+  tags). Already the first candidate in `data/dataset.py::_TEXT_FIELDS`.
+- **Audio = the `audio` column**, decoded with soundfile/librosa (no torchcodec).
+- There is **no `verification_report` column**, so `quality_filter` /
+  `min_quality_decision` are a no-op here. The "get clean audio" lever for ‑R is
+  `huggingface.min_snr` / `huggingface.max_cer` (off by default — ‑R is already
+  clean; set e.g. `min_snr: 15.0`, `max_cer: 0.5` to drop the worst clips).
 
-**Root cause**: On macOS Python 3.12, multiprocessing defaults to `spawn`.
-The HF streaming dataset holds internal thread locks which can't be pickled
-and sent to spawned workers.
+### Access + token (this was the `DatasetNotFoundError` you hit)
 
-**Fix in `training/trainer.py`** — change `_build_loader`:
+The HF token lives in `config.json` (`huggingface.token`, REV-encoded) and
+`bootstrap()` exports it to `HF_TOKEN`/`HUGGING_FACE_HUB_TOKEN`. Every real
+entrypoint (`train.py`, `inference.py`, `tools/build_dataset.py`) calls
+`bootstrap()`, so they authenticate automatically. `setup_colab.sh` now also
+bootstraps before its access check, so it reads the **configured** repo + token
+instead of a hardcoded `ai4bharat/IndicVoices` with an empty `HF_TOKEN`.
 
-```python
-def _build_loader(self) -> DataLoader:
-    dataset = IndicVoicesDataset(...)
-    collator = DelayedStreamCollator(text_pad_id=self.tokenizer.pad_id)
-
-    # FIXED: on macOS/non-Linux, use num_workers=0 (no forking).
-    # On Linux (Colab/Kaggle), use the configured num_workers.
-    import platform
-    nw = self.tcfg.num_workers if platform.system() == "Linux" else 0
-    if nw == 0 and self.tcfg.num_workers > 0:
-        import logging
-        logging.getLogger("training.trainer").warning(
-            "macOS detected — setting num_workers=0 to avoid DataLoader "
-            "pickle error with HF streaming datasets.")
-
-    return DataLoader(
-        dataset, batch_size=self.tcfg.batch_size, collate_fn=collator,
-        num_workers=nw, pin_memory=(self.device.type == "cuda"),
-        drop_last=True, persistent_workers=nw > 0,
-        # No multiprocessing_context needed when nw=0
-        multiprocessing_context=self._worker_mp_context() if nw > 0 else None)
-```
-
-Or the quick config fix: set `"num_workers": 0` in `config.json` while testing on Mac.
+If a check still fails: confirm `huggingface.token` is a valid `hf_…` token and,
+if the chosen repo is gated, that you accepted its terms on the Hub while logged
+in as that token's owner.
 
 ---
 
-## Bug 2: Training on MPS (Mac GPU) — Wrong Precision
+## macOS / DataLoader / MPS notes
 
-Your log shows:
-```
-Starting training on mps (precision=torch.float32) for 200000 steps
-```
-
-- MPS doesn't support bf16 or fp16 AMP — `float32` is correct.
-- MPS is ~3–5× slower than a T4 GPU for this model size.
-- `max_steps: 200000` on MPS would take days.
-
-**For real training, use Colab/Kaggle (free T4/A100).**
-On Mac, run only short smoke tests with `max_steps: 50`.
+- **The `cannot pickle '_thread.RLock'` crash is already guarded against.** The
+  trainer forces the `fork` start method for workers (`_worker_mp_context`), and
+  `VoiceBank` drops its `RLock` on pickle (`__getstate__`/`__setstate__`). You do
+  **not** need to rewrite `_build_loader`. If you still hit a pickling error on a
+  Mac smoke test, just set `"num_workers": 0` in `config.json` — don't remove the
+  fork-forcing logic.
+- **MPS precision**: `_resolve_precision` returns `float32` on non-CUDA devices
+  (MPS has no usable bf16/fp16 AMP) — correct, but ~3–5× slower than a T4. Use
+  Mac only for short smoke tests; train on Colab/Kaggle (T4) or better.
 
 ---
 
-## Why acc_cb0 Stays Very Low
+## Why acc_cb0 Stays Low (this part of the original guide is correct)
 
-This is the most important thing to understand:
-
-| Codebook | What it captures | Difficulty | Expected accuracy @ 5k steps |
-|----------|-----------------|------------|-------------------------------|
+| Codebook | What it captures | Difficulty | Approx acc @ 5k steps |
+|----------|-----------------|------------|------------------------|
 | cb0 | Semantic content (WavLM-distilled) | ★★★★★ hardest | 5–15% |
 | cb1 | Coarse acoustic residual | ★★★★ | 20–40% |
 | cb2–cb5 | Mid acoustic residuals | ★★★ | 40–65% |
 | cb6–cb7 | Fine texture | ★★ easiest | 60–80% |
 
-**Why cb0 is hardest**: Mimi's training distills WavLM/HuBERT features into cb0,
-making it a semantic token (what is being said, how it's pronounced, prosody).
-Predicting the exact cb0 index from text alone is like predicting the exact word
-embedding from the written word — high entropy, many valid realizations.
+Mimi distills WavLM/HuBERT features into **cb0**, making it a *semantic* token
+(what is being said + prosody). Predicting the exact cb0 index from text is
+high-entropy, many valid realizations. Random chance = 1/2048 ≈ **0.05%**; even a
+well-trained model lands ~20–35%. Low early acc_cb0 is **normal**.
 
-Random chance = 1/2048 ≈ **0.05%**. Even a well-trained model gets 20–35%.
-Low acc_cb0 early in training is **completely normal**.
+### Levers that actually help cb0 (corrected)
 
-### What actually causes pathologically low acc_cb0:
-
-**1. Training never ran** (your case — the DataLoader crash above).
-Fix the crash first.
-
-**2. Too many unique speakers (`speaker_id_source="row"`)**
-IndicVoices has thousands of unique speaker IDs. With `strategy="embedding_table"`,
-most speakers are seen only a few times. The model wastes capacity learning
-speaker embeddings for speakers it barely sees, at the cost of cb0 quality.
-
-```json
-// config.json fix:
-"voice": {
-    "speaker_id_source": "gender",   // collapse to hi_female / hi_male
-    "strategy": "embedding_table",
-    "max_speakers": 8,               // small table, well-trained
-    ...
-}
-```
-
-**3. Learning rate too low for the first codebook**
-cb0 needs more signal. Try label_smoothing=0.1 to smooth the cross-entropy
-targets — it prevents the model from becoming overconfident on cb1-7 at the
-expense of cb0.
-
-**4. Training too short**
-6000 steps is the minimum to see cb0 start climbing. For usable quality, plan:
-- 20k steps: acc_cb0 ≈ 20%, intelligible Hindi speech
-- 50k steps: acc_cb0 ≈ 30%, good naturalness
-- 100k+ steps: acc_cb0 ≈ 35–40%, high quality
+1. **Weight the depth transformer toward cb0** — `model.codebook_loss_weights`
+   (see next section). This is the cheapest, no-slowdown lever and the
+   recommended first move.
+2. **Don't collapse speakers to gender.** The earlier guide suggested
+   `speaker_id_source="gender"` — that **conflicts** with wanting real per-speaker
+   voices, and isn't needed for IndicVoices‑R Hindi (a few hundred speakers, each
+   with many utterances, train fine). Keep `speaker_id_source="row"` and make
+   indices collision-free by pre-building the catalog (`tools/build_dataset.py`,
+   which `setup_colab.sh` runs).
+3. **label_smoothing** (e.g. 0.1) can curb over-confidence, but it inflates the
+   reported CE; keep it 0 if you want `train/val ppl` to be a true perplexity.
+4. **Train longer.** 6k steps is the floor; 20k+ for naturalness.
 
 ---
 
-## Proven Training Recipe for Hindi + Mimi
+## Lever: weight the depth transformer (`codebook_loss_weights`)
 
-### Step 1: Fix config.json for Hindi training
+The depth transformer predicts **all** Q codebooks under one cross-entropy. The
+loss is now a per-codebook **weighted** CE so depth capacity focuses where it
+matters — **without adding parameters, so training speed is unchanged**.
+
+```json
+"model": {
+    "arch": "rq_transformer_tts",
+    "codebook_loss_weights": [2.0, 1.4, 1.1, 1.0, 0.9, 0.8, 0.7, 0.6]
+}
+```
+
+- Up-weights **cb0** (semantic / intelligibility) and the coarse codebooks;
+  down-weights fine texture (cb6/cb7), which the model learns easily and which
+  matter least for intelligibility.
+- Weights are **renormalized to mean 1** internally, so loss scale and perplexity
+  stay comparable to a uniform run (init loss still ≈ ln(2048) ≈ 7.62).
+- `null` / omitted = uniform (original behavior). A list of the wrong length is a
+  hard error. Implemented in both v1 and v2
+  (`RQTransformerTTS._build_codebook_weights` + weighted CE in `compute_loss`).
+
+---
+
+## Recommended `config.json` (Hindi + Mimi)
 
 ```json
 {
   "huggingface": {
-    "dataset_repo": "ai4bharat/IndicVoices",
-    "dataset_config": "hindi",
+    "dataset_repo": "SPRINGLab/IndicVoices-R_Hindi",
+    "dataset_config": null,
     "dataset_split": "train",
     "streaming": true,
     "languages": ["hi"],
     "shuffle_buffer_size": 10000,
-    "quality_filter": true,
-    "min_quality_decision": "good",
+    "min_snr": null,
+    "max_cer": null,
     "val_holdout_mod": 20
   },
   "voice": {
     "strategy": "embedding_table",
-    "speaker_id_source": "gender",
-    "max_speakers": 8,
-    "embedding_dim": 256
+    "speaker_id_source": "row",
+    "max_speakers": 8192,
+    "embedding_dim": 768
+  },
+  "model": {
+    "arch": "rq_transformer_tts",
+    "codebook_loss_weights": [2.0, 1.4, 1.1, 1.0, 0.9, 0.8, 0.7, 0.6]
   },
   "training": {
     "device": "auto",
     "precision": "bf16",
     "batch_size": 16,
     "grad_accum_steps": 4,
-    "max_steps": 50000,
-    "warmup_steps": 1000,
+    "max_steps": 6000,
+    "warmup_steps": 600,
     "lr": 2e-4,
     "min_lr": 1e-5,
-    "label_smoothing": 0.1,
+    "label_smoothing": 0.0,
     "num_workers": 4,
-    "eval_every": 500,
-    "save_every": 2000
+    "eval_every": 250,
+    "save_every": 1000
   }
 }
 ```
 
-### Step 2: Pre-encode Mimi codes (speeds up training 3-5×)
+`max_steps: 6000` is the deliberate from-scratch budget (a 250M model can't
+converge in 6k; this ~150M one starts forming words). Raise it only if you also
+raise model size and have the compute.
 
-On-the-fly Mimi encoding wastes GPU cycles. Pre-encode the dataset once:
+---
+
+## Pre-encoding Mimi codes (optional throughput win)
+
+On-the-fly Mimi encoding costs GPU each step. You can pre-encode once into
+`paths.mimi_code_cache_dir` (`data/mimi_codes`). Note the correct import is
+`bootstrap` (there is no `setup`), and the dataset yields `wav` / `text_ids` /
+`speaker_index`:
 
 ```python
 # tools/precompute_mimi.py  (run once before training)
-import torch, os
+import torch
 from pathlib import Path
+from milli_tts.bootstrap import bootstrap
 from milli_tts.data.mimi_codec import MimiCodec
-from milli_tts.bootstrap import setup
-
-setup()
-codec = MimiCodec.from_config(device=torch.device("cuda"))
-cache_dir = Path("data/mimi_codes")
-cache_dir.mkdir(parents=True, exist_ok=True)
-
 from milli_tts.data.dataset import IndicVoicesDataset
-from milli_tts.data.text_tokenizer import TextTokenizer
-from milli_tts.data.voice_bank import VoiceBank
 
-tokenizer = TextTokenizer.from_config()
-voice_bank = VoiceBank.from_config()
-ds = IndicVoicesDataset(tokenizer=tokenizer, voice_bank=voice_bank,
-                        register_voices=True, role="train")
+bootstrap()
+codec = MimiCodec.from_config(device=torch.device("cuda"))
+cache_dir = Path("data/mimi_codes"); cache_dir.mkdir(parents=True, exist_ok=True)
 
-for i, sample in enumerate(ds):
-    key = f"{i:07d}"
-    wav = sample["wav"].unsqueeze(0).unsqueeze(0).cuda()   # [1, 1, T]
-    codes = codec.encode(wav).cpu()                        # [1, Q, frames]
-    out = {"codes": codes[0], "text_ids": sample["text_ids"],
-           "speaker_index": sample["speaker_index"]}
-    torch.save(out, cache_dir / f"{key}.pt")
-    if i % 1000 == 0:
-        print(f"Encoded {i} samples")
-    if i >= 50000:  # encode 50k for start
-        break
+ds = IndicVoicesDataset(register_voices=True, role="train")
+for i, s in enumerate(ds):
+    wav = s["wav"].unsqueeze(0).unsqueeze(0).cuda()   # [1, 1, T]
+    codes = codec.encode(wav).cpu()                   # [1, Q, frames]
+    torch.save({"codes": codes[0], "text_ids": s["text_ids"],
+                "speaker_index": s["speaker_index"]}, cache_dir / f"{i:07d}.pt")
+    if i >= 50000: break
 ```
 
-Then modify the dataset to load from cache instead of decoding on-the-fly.
+This is a starting point — you still need a cache-loading dataset to consume the
+`.pt` files. Not required to start training (streaming + on-GPU encode works).
 
-### Step 3: Monitor these metrics
+---
 
-| Metric | Healthy at step 1k | Healthy at step 10k |
-|--------|-------------------|---------------------|
+## Metrics to watch
+
+| Metric | Healthy @ 1k | Healthy @ 10k |
+|--------|-------------|----------------|
 | train/loss | 5.5–6.5 | 4.0–5.0 |
 | train/acc | 3–8% | 15–30% |
 | train/acc_cb0 | 1–5% | 8–20% |
 | val/acc_cb0 | ~1–3% | ~6–15% |
 | train/ppl | 300–600 | 60–150 |
 
-If `train/loss` stays above 7.0 after 1k steps, learning rate is too low.
-If `train/acc_cb0` is 0.05% (random chance) at step 5k, the model isn't learning — check:
-1. DataLoader is actually feeding data (not crashing silently)
-2. Audio codes are not all-zero (Mimi loaded correctly)
-3. Speaker conditioning is not all-zeros (conditioner initialized)
+If `train/loss` stays > 7.0 after 1k steps → LR too low / warmup too slow.
+If `acc_cb0` is stuck at 0.05% past 5k steps, check, in order:
+1. Data is actually flowing (the preflight + heartbeat logs print).
+2. Mimi loaded the real codec (codes aren't all-zero; `codec.allow_dummy=false`).
+3. Speaker conditioning isn't all-zeros (catalog built / voices_seen > 0).
 
-### Step 4: Colab/Kaggle launch command
+---
 
-```bash
-# On T4 GPU (Colab/Kaggle):
-pip install -e . moshi soundfile datasets huggingface_hub wandb
-
-# Set your tokens in config.json or as env vars:
-export HF_TOKEN=your_token
-export WANDB_API_KEY=your_key
-
-python train.py
-```
-
-### Step 5: Smoke test on Mac first
+## Launch
 
 ```bash
-# Quick sanity check (no GPU needed):
-python -c "
-from milli_tts.bootstrap import setup
-from milli_tts.training.trainer import Trainer
-import json, pathlib
-
-# Patch config for smoke test
-cfg_path = pathlib.Path('config.json')
-cfg = json.loads(cfg_path.read_text())
-cfg['training']['max_steps'] = 5
-cfg['training']['num_workers'] = 0
-cfg['training']['batch_size'] = 2
-cfg['codec']['allow_dummy'] = True
-cfg['wandb']['enabled'] = False
-tmp = pathlib.Path('/tmp/smoke_config.json')
-tmp.write_text(json.dumps(cfg))
-
-import os; os.environ['MILLI_CONFIG'] = str(tmp)
-setup()
-Trainer().train()
-print('Smoke test passed!')
-"
+# Colab/Kaggle (T4+). Token + W&B key are read from config.json.
+bash setup_colab.sh          # installs deps, checks dataset access, builds catalog
+python train.py              # auto single/multi-GPU
+python inference.py --interactive
 ```
 
 ---
 
-## Quick Reference: Architecture Shapes
+## Architecture shapes (reference)
 
 ```
-Text:           [B, Lt]     →  [B, Lt, 768]   text_embedder
-Audio in:       [B, 8, Ta]  →  [B, Ta, 768]   audio_embedder (sum over Q)
+Text:           [B, Lt]     →  [B, Lt, 768]   text embedder
+Audio in:       [B, 8, Ta]  →  [B, Ta, 768]   audio embedder (sum over Q)
 Speaker:        [B]         →  [B, 768]        conditioner
-Joint seq:      [B, Lt+Ta, 768]
-Backbone out:   [B, Lt+Ta, 768]  (causal)
+Joint seq:      [B, Lt+Ta, 768]  → backbone (causal) → [B, Lt+Ta, 768]
 h_audio:        [B, Ta, 768]     (slice Lt:)
-Depth in:       [B*Ta, 8, 768]   (Q steps)
-Depth out:      [B*Ta, 8, 2048]  (Q × codebook logits)
-Loss:           CE over M×8 valid (non-padded) tokens
+Depth in:       [B*Ta, 8, 768]   → depth (causal over Q) → [B*Ta, 8, 2048]
+Loss:           weighted CE over M×8 valid (non-padded) tokens
 ```
 
 ---
 
-## Using the New Modular Architecture
+## Switching to the v2 model
 
-Register `rq_transformer_tts_v2` in the model factory:
+v2 is **already registered** (`models/factory.py`), so no code edit is needed —
+just set the arch in `config.json`:
 
-```python
-# milli_tts/models/factory.py  — add this import and registration
-
-from milli_tts.models.rq_transformer_v2 import RQTransformerTTSv2
-
-_REGISTRY["rq_transformer_tts_v2"] = RQTransformerTTSv2
-```
-
-Then in `config.json`:
 ```json
-"model": {
-    "arch": "rq_transformer_tts_v2",
-    ...
-}
+"model": { "arch": "rq_transformer_tts_v2" }
 ```
 
-The new model is **drop-in compatible** — same `compute_loss` and `generate` interface,
-same config keys, same checkpoint format.
+Same config keys, same `compute_loss`/`generate`, same checkpoint format as v1.
+(The earlier `_REGISTRY["…"] = …` snippet was wrong — the factory uses
+`@MODEL_REGISTRY.register("…")` builders.)
